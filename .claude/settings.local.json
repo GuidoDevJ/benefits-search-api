@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(del srcagentsresearcher_agent.py)",
+      "Bash(del srcagentswriter_agent.py)",
+      "Bash(findstr:*)",
+      "Bash(dir:*)",
+      "Bash(where:*)",
+      "Bash(pip show:*)",
+      "Bash(mdpdf:*)",
+      "Bash(venvScriptspython.exe docsgenerate_pdf.py)"
+    ]
+  }
+}
