@@ -12,7 +12,7 @@ Este agente:
 import json
 
 # Third-party imports
-from langchain_openai import ChatOpenAI
+from langchain_aws import ChatBedrock
 
 try:
     from ..tools.benefits_api import search_benefits, search_benefits_async
@@ -30,7 +30,7 @@ Si no hay resultados: "No encontré beneficios. Intenta otra búsqueda."
 Usa emojis: 🎁💳🏷️🍔🛒⛽👗📍📅✅. No uses: ❌😀🔥💰👍"""
 
 
-def create_benefits_agent(llm: ChatOpenAI):
+def create_benefits_agent(llm: ChatBedrock):
     """
     Crea el agente async de búsqueda de beneficios.
 

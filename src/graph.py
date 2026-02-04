@@ -1,16 +1,19 @@
-from langchain_openai import ChatOpenAI
+from langchain_aws import ChatBedrock
 from langgraph.graph import END, StateGraph
 
 from .agents.base_agent import AgentState
 from .agents.benefits_agent import create_benefits_agent
 from .agents.supervisor_agent import create_supervisor_agent
-from .config import OPENAI_API_KEY
+from .config import AWS_REGION, BEDROCK_MODEL_ID
 
 
 def create_multiagent_graph():
     """Crea el grafo multiagente con supervisor para búsqueda de beneficios"""
 
-    llm = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY)
+    llm = ChatBedrock(
+        model_id=BEDROCK_MODEL_ID,
+        region_name=AWS_REGION,
+    )
 
     # Crear agente de beneficios
     benefits = create_benefits_agent(llm)

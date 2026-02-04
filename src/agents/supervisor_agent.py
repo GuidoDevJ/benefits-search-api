@@ -2,11 +2,11 @@
 Supervisor Agent - Agente async que coordina los demás agentes.
 """
 
-from langchain_openai import ChatOpenAI
+from langchain_aws import ChatBedrock
 from langchain_core.messages import SystemMessage
 
 
-def create_supervisor_agent(llm: ChatOpenAI, agents: list[str]):
+def create_supervisor_agent(llm: ChatBedrock, agents: list[str]):
     """
     Crea un agente supervisor async que coordina la búsqueda de beneficios.
 
