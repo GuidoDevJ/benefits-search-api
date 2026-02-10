@@ -1,0 +1,154 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        default: "prod"
+        type: choice
+        options:
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_NAME: ia-comafi
+
+jobs:
+  # -------------------------------------------
+  # Job 1: Build & Push Docker image to ECR
+  # -------------------------------------------
+  build:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      ecr_registry: ${{ steps.login-ecr.outputs.registry }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "image_tag=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ env.PROJECT_NAME }}-api
+          IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
+        run: |
+          docker build \
+            --cache-from $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+  # -------------------------------------------
+  # Job 2: Deploy infrastructure with CDK
+  # -------------------------------------------
+  deploy:
+    name: CDK Deploy
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup Node.js (for CDK CLI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install CDK CLI
+        run: npm install -g aws-cdk
+
+      - name: Install CDK Python dependencies
+        working-directory: infra
+        run: pip install -r requirements.txt
+
+      - name: CDK Diff (preview changes)
+        working-directory: infra
+        run: |
+          cdk diff --all \
+            -c image_tag=${{ needs.build.outputs.image_tag }} \
+          || true
+
+      - name: CDK Deploy
+        working-directory: infra
+        run: |
+          cdk deploy --all \
+            --require-approval never \
+            -c image_tag=${{ needs.build.outputs.image_tag }}
+
+  # -------------------------------------------
+  # Job 3: Post-deploy health check
+  # -------------------------------------------
+  health-check:
+    name: Health Check
+    needs: deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get service URL from CloudFormation
+        id: get-url
+        run: |
+          URL=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.PROJECT_NAME }}-compute \
+            --query "Stacks[0].Outputs[?OutputKey=='ServiceUrl'].OutputValue" \
+            --output text)
+          echo "service_url=${URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for service to stabilize
+        run: sleep 30
+
+      - name: Run health check
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${{ steps.get-url.outputs.service_url }}/")
+          echo "Health check status: $STATUS"
+          if [ "$STATUS" -ne 200 ]; then
+            echo "::error::Health check failed with status $STATUS"
+            exit 1
+          fi
+          echo "Health check passed"

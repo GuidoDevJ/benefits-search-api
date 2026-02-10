@@ -1,0 +1,26 @@
+{
+  "app": "python app.py",
+  "watch": {
+    "include": ["**"],
+    "exclude": [
+      "README.md",
+      "cdk*.json",
+      "requirements*.txt",
+      "**/__pycache__",
+      "**/*.pyc"
+    ]
+  },
+  "context": {
+    "project_name": "ia-comafi",
+    "environment": "prod",
+    "image_tag": "latest",
+    "nat_gateways": 1,
+    "fargate_cpu": 512,
+    "fargate_memory": 1024,
+    "min_capacity": 1,
+    "max_capacity": 3,
+    "redis_node_type": "cache.t3.micro",
+    "waf_rate_limit": 2000,
+    "@aws-cdk/aws-ecs:enableFargateCapacityProviders": true
+  }
+}
