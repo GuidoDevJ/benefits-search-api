@@ -1,5 +1,5 @@
 from typing import TypedDict, Annotated
-from langchain_openai import ChatOpenAI
+from langchain_aws import ChatBedrock
 from langchain_core.messages import (
     BaseMessage,
     SystemMessage,
@@ -16,7 +16,7 @@ class AgentState(TypedDict):
     context: dict
 
 
-def create_agent(llm: ChatOpenAI, tools: list, system_prompt: str):
+def create_agent(llm: ChatBedrock, tools: list, system_prompt: str):
     """
     Factory para crear agentes con herramientas.
 
