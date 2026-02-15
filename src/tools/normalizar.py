@@ -31,16 +31,15 @@ def normalize_promo(promo: any) -> any:
     benefit_type = BENEFIT_TYPE.get(promo["t"])
 
     if benefit_type == "descuento":
-        beneficio = f'{promo["d"]}% de descuento'
+        beneficio = f'{promo["d"]}%'
     elif benefit_type == "cuotas":
-        beneficio = f'{promo["q"]} cuotas sin interés'
+        beneficio = f'{promo["q"]}c'
     else:
-        beneficio = f'{promo["d"]}% de descuento y {promo["q"]} cuotas'
+        beneficio = f'{promo["d"]}%+{promo["q"]}c'
 
-    # Solo campos esenciales para reducir tamaño del JSON
     return {
-        "comercio": promo["b"],
-        "beneficio": beneficio,
-        "medio_pago": promo["ct"],
+        "nom": promo["b"],
+        "ben": beneficio,
+        "pago": promo["ct"],
         "dias": parse_days(promo["a"]),
     }

@@ -33,6 +33,9 @@ CACHE_ENABLED = os.getenv("CACHE_ENABLED", "true").lower() == "true"
 # AWS S3 Configuration
 S3_BUCKET_UNHANDLED = os.getenv("S3_BUCKET_UNHANDLED", "comafi-ai-logs")
 
+# Serialization Format for LLM communication ("json" or "toon")
+SERIALIZATION_FORMAT = os.getenv("SERIALIZATION_FORMAT", "json")
+
 # Validaciones
 if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
     raise ValueError(
