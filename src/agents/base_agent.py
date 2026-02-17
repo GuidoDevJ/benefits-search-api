@@ -8,6 +8,8 @@ from langchain_core.messages import (
 )
 import operator
 
+from src.serialization import get_serializer
+
 
 class AgentState(TypedDict):
     """Estado compartido entre todos los agentes"""
@@ -29,8 +31,11 @@ def create_agent(llm: ChatBedrock, tools: list, system_prompt: str):
 
     def agent_node(state: AgentState):
         messages = state["messages"]
+        serializer = get_serializer()
 
         # Crear lista temporal con system prompt
+        # No se inyecta format_hint aquí — solo en agentes que procesan
+        # datos serializados (ej: benefits_agent)
         temp_messages = []
         if system_prompt:
             temp_messages.append(SystemMessage(content=system_prompt))
@@ -55,9 +60,10 @@ def create_agent(llm: ChatBedrock, tools: list, system_prompt: str):
                 # Ejecutar la herramienta
                 if tool_name in tool_map:
                     tool_result = tool_map[tool_name].invoke(tool_args)
+                    tool_content = serializer.serialize(tool_result)
                     tool_messages.append(
                         ToolMessage(
-                            content=str(tool_result),
+                            content=tool_content,
                             tool_call_id=tool_call['id']
                         )
                     )

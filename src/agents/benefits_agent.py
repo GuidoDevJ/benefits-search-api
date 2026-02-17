@@ -19,15 +19,18 @@ try:
 except ImportError:
     from src.tools.benefits_api import search_benefits, search_benefits_async
 
+from src.serialization import get_serializer
 
-SYSTEM_PROMPT = """Eres un asistente de beneficios TeVaBien. Usa search_benefits pasando la consulta EXACTA del usuario.
+SYSTEM_PROMPT = """Asistente de beneficios TeVaBien. Usa search_benefits con la consulta exacta del usuario.
 
-Formato respuesta:
-🎁 Encontré X beneficios:
-1. **Comercio** 🏷️ Beneficio | 💳 Medio | 📅 Días
+Campos: nom=comercio, ben=beneficio (%=descuento, c=cuotas), pago=medio de pago, dias=días válidos.
 
-Si no hay resultados: "No encontré beneficios. Intenta otra búsqueda."
-Usa emojis: 🎁💳🏷️🍔🛒⛽👗📍📅✅. No uses: ❌😀🔥💰👍"""
+Formato:
+🎁 X beneficios:
+1. **nom** 🏷️ ben | 💳 pago | 📅 dias
+
+Sin resultados: "No encontré beneficios. Intenta otra búsqueda."
+"""
 
 
 def create_benefits_agent(llm: ChatBedrock):
@@ -41,6 +44,7 @@ def create_benefits_agent(llm: ChatBedrock):
         Función async del nodo del agente
     """
     from langchain_core.messages import SystemMessage, ToolMessage
+
     from .base_agent import AgentState
 
     tools = [search_benefits]
@@ -50,11 +54,16 @@ def create_benefits_agent(llm: ChatBedrock):
         """Nodo async del agente con tool execution."""
         messages = state["messages"]
         context = state.get("context", {})
+        serializer = get_serializer()
 
         # Crear lista temporal con system prompt
         temp_messages = []
         if SYSTEM_PROMPT:
-            temp_messages.append(SystemMessage(content=SYSTEM_PROMPT))
+            format_hint = serializer.get_format_instruction()
+            prompt = SYSTEM_PROMPT
+            if format_hint:
+                prompt = f"{SYSTEM_PROMPT}\n\n{format_hint}"
+            temp_messages.append(SystemMessage(content=prompt))
         temp_messages.extend(messages)
 
         # Invocación async con tools
@@ -91,25 +100,18 @@ def create_benefits_agent(llm: ChatBedrock):
                             else:
                                 result_dict = {}
 
-                            success_data = result_dict.get("success", [])
+                            benefits = result_dict.get("data", [])
                             has_benefits = (
-                                isinstance(success_data, list)
-                                and len(success_data) > 0
+                                isinstance(benefits, list) and len(benefits) > 0
                             )
                         except Exception:
                             has_benefits = False
 
-                    # Convertir tool_result a JSON string si es dict
-                    if isinstance(tool_result, dict):
-                        tool_content = json.dumps(tool_result, ensure_ascii=False)
-                    else:
-                        tool_content = str(tool_result)
+                    # Serializar tool_result (JSON o TOON según config)
+                    tool_content = serializer.serialize(tool_result)
 
                     tool_messages.append(
-                        ToolMessage(
-                            content=tool_content,
-                            tool_call_id=tool_call["id"]
-                        )
+                        ToolMessage(content=tool_content, tool_call_id=tool_call["id"])
                     )
 
             # Agregar al contexto temporal

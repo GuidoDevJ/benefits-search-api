@@ -296,10 +296,7 @@ async def search_benefits_async(query: str) -> dict:
             print(f"[Push] Error enviando notificación: {push_error}")
 
         return {
-            "success": [],
-            "intent": nlp_result.intent,
-            "filters_applied": {},
-            "url": "",
+            "data": [],
             "error": "No se detectaron entidades en la consulta",
         }
 
@@ -310,13 +307,10 @@ async def search_benefits_async(query: str) -> dict:
     for benefit in (response.data or [])[:5]:
         datas_json.append(normalize_promo(benefit.model_dump()))
 
-    return {
-        "success": datas_json,
-        "intent": nlp_result.intent,
-        "filters_applied": nlp_result.entities.model_dump(exclude_none=True),
-        "url": response.url,
-        "error": response.error,
-    }
+    result: dict = {"data": datas_json}
+    if response.error:
+        result["error"] = response.error
+    return result
 
 
 @tool
