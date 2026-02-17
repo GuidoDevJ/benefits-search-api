@@ -36,6 +36,19 @@ S3_BUCKET_UNHANDLED = os.getenv("S3_BUCKET_UNHANDLED", "comafi-ai-logs")
 # Serialization Format for LLM communication ("json" or "toon")
 SERIALIZATION_FORMAT = os.getenv("SERIALIZATION_FORMAT", "json")
 
+# Audit Configuration
+AUDIT_ENABLED = os.getenv("AUDIT_ENABLED", "true").lower() == "true"
+AUDIT_EXPORTER = os.getenv("AUDIT_EXPORTER", "jsonfile")  # stdout | jsonfile
+AUDIT_LOG_DIR = os.getenv("AUDIT_LOG_DIR", "logs")
+AUDIT_DEBUG = os.getenv("AUDIT_DEBUG", "false").lower() == "true"
+AUDIT_INCLUDE_SNAPSHOTS = os.getenv("AUDIT_INCLUDE_SNAPSHOTS", "true").lower() == "true"
+
+# Sampling Configuration
+TRACE_SAMPLE_RATE = float(os.getenv("TRACE_SAMPLE_RATE", "0.20"))
+SUCCESS_SAMPLE_RATE = float(os.getenv("SUCCESS_SAMPLE_RATE", "0.10"))
+ERROR_SAMPLE_RATE = float(os.getenv("ERROR_SAMPLE_RATE", "1.00"))
+SLOW_REQUEST_THRESHOLD_MS = float(os.getenv("SLOW_REQUEST_THRESHOLD_MS", "1500"))
+
 # Validaciones
 if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
     raise ValueError(
