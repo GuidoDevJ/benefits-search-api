@@ -1,58 +1,58 @@
 """
-Supervisor Agent - Agente async que coordina los demás agentes.
+Supervisor Agent - Agente async que controla respuestas negativas del benefits agent.
+
+Se ejecuta solo cuando benefits no encontró resultados, para intentar
+reformular la búsqueda o dar una respuesta útil al usuario.
 """
 
 from langchain_aws import ChatBedrock
 from langchain_core.messages import SystemMessage
 
 
-def create_supervisor_agent(llm: ChatBedrock, agents: list[str]):
+def create_supervisor_agent(llm: ChatBedrock):
     """
-    Crea un agente supervisor async que coordina la búsqueda de beneficios.
+    Crea un agente supervisor async que actúa como controlador de calidad.
 
-    El supervisor decide cuándo llamar al agente de beneficios y
-    cuándo finalizar.
+    Se ejecuta únicamente cuando el benefits agent no encontró resultados,
+    para decidir si reformular la búsqueda o finalizar.
     """
 
-    agents_str = ', '.join(agents)
     system_prompt = (
-        f"Eres un supervisor que coordina la búsqueda de "
-        f"beneficios.\n\n"
-        f"Agentes disponibles: {agents_str}\n\n"
-        "Capacidades de cada agente:\n"
-        "- benefits: Busca y presenta beneficios de TeVaBien "
-        "basándose en consultas del usuario\n\n"
+        "Eres un supervisor que controla la calidad de las respuestas "
+        "del agente de beneficios.\n\n"
+        "El agente de beneficios no encontró resultados para la consulta "
+        "del usuario. Tu tarea es analizar la consulta original y decidir "
+        "si tiene sentido reintentar con una búsqueda reformulada.\n\n"
         "Reglas:\n"
-        "1. Si el usuario pregunta por promociones/beneficios/"
-        "descuentos → llama a 'benefits'\n"
-        "2. Si benefits ya respondió con información → "
-        "responde 'FINISH'\n"
-        "3. Si no hay consulta o la tarea está completa → "
-        "responde 'FINISH'\n\n"
-        "Responde ÚNICAMENTE con: 'benefits' o 'FINISH'"
+        "1. Si la consulta del usuario es clara y sobre beneficios/"
+        "promociones/descuentos pero no se encontraron resultados, "
+        "responde 'RETRY' para reintentar\n"
+        "2. Si la consulta ya fue reintentada (verás mensajes previos "
+        "del agente de beneficios) → responde 'FINISH'\n"
+        "3. Si la consulta no tiene sentido o no está relacionada "
+        "con beneficios → responde 'FINISH'\n\n"
+        "Responde ÚNICAMENTE con: 'RETRY' o 'FINISH'"
     )
 
     async def supervisor_node(state):
-        """Nodo async del supervisor."""
-        # Verificar si el agente de beneficios ya fue ejecutado
+        """Nodo async del supervisor - controlador de calidad."""
         context = state.get("context", {})
-        has_benefits = context.get("has_benefits", None)
 
-        # Si benefits ya ejecutó (independiente del resultado), finalizar
-        if has_benefits is not None:
+        # Si ya se reintentó una vez, finalizar para evitar loops
+        if context.get("retried", False):
             return {"next": "finish"}
 
         messages = (
             [SystemMessage(content=system_prompt)] + state["messages"]
         )
 
-        # Invocación async
         response = await llm.ainvoke(messages)
-        next_agent = response.content.strip().lower()
+        decision = response.content.strip().upper()
 
-        if next_agent not in agents and next_agent != "finish":
-            next_agent = "finish"
+        if decision == "RETRY":
+            context["retried"] = True
+            return {"next": "retry", "context": context}
 
-        return {"next": next_agent}
+        return {"next": "finish"}
 
     return supervisor_node

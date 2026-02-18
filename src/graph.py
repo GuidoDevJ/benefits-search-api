@@ -8,48 +8,62 @@ from .config import AWS_REGION, BEDROCK_MODEL_ID
 
 
 def create_multiagent_graph():
-    """Crea el grafo multiagente con supervisor para búsqueda de beneficios"""
+    """
+    Crea el grafo multiagente con benefits como punto de entrada
+    y supervisor como controlador de calidad al final.
+
+    Flujo:
+        benefits → (has_benefits?) → END (si positivo)
+                                   → supervisor (si negativo)
+                                       → benefits (retry) → END
+                                       → END (finish)
+    """
 
     llm = ChatBedrock(
         model_id=BEDROCK_MODEL_ID,
         region_name=AWS_REGION,
     )
 
-    # Crear agente de beneficios
     benefits = create_benefits_agent(llm)
+    supervisor = create_supervisor_agent(llm)
 
-    # Lista de agentes para el supervisor
-    agents = ["benefits"]
-    supervisor = create_supervisor_agent(llm, agents)
-
-    # Crear el grafo
     workflow = StateGraph(AgentState)
 
     # Agregar nodos
-    workflow.add_node("supervisor", supervisor)
     workflow.add_node("benefits", benefits)
+    workflow.add_node("supervisor", supervisor)
 
-    # Agregar edges desde cada agente de vuelta al supervisor
-    for agent in agents:
-        workflow.add_edge(agent, "supervisor")
+    # Después de benefits, decidir si ir al supervisor o terminar
+    def after_benefits(state):
+        context = state.get("context", {})
+        has_benefits = context.get("has_benefits", False)
 
-    # Agregar edges condicionales desde el supervisor
-    def should_continue(state):
-        next_agent = state.get("next", "finish")
-        if next_agent == "finish":
-            return "finish"
-        return next_agent
+        if has_benefits:
+            return "end"
+        return "supervisor"
 
-    # Crear el mapeo de edges
-    conditional_map = {agent: agent for agent in agents}
-    conditional_map["finish"] = END
+    workflow.add_conditional_edges(
+        "benefits",
+        after_benefits,
+        {"end": END, "supervisor": "supervisor"},
+    )
 
-    workflow.add_conditional_edges("supervisor", should_continue, conditional_map)
+    # Después del supervisor, decidir si reintentar o terminar
+    def after_supervisor(state):
+        next_action = state.get("next", "finish")
+        if next_action == "retry":
+            return "retry"
+        return "finish"
 
-    # Punto de entrada
-    workflow.set_entry_point("supervisor")
+    workflow.add_conditional_edges(
+        "supervisor",
+        after_supervisor,
+        {"retry": "benefits", "finish": END},
+    )
 
-    # Compilar el grafo
+    # Punto de entrada: benefits agent directamente
+    workflow.set_entry_point("benefits")
+
     graph = workflow.compile()
 
     return graph
