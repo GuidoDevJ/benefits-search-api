@@ -36,6 +36,20 @@ S3_BUCKET_UNHANDLED = os.getenv("S3_BUCKET_UNHANDLED", "comafi-ai-logs")
 # Serialization Format for LLM communication ("json" or "toon")
 SERIALIZATION_FORMAT = os.getenv("SERIALIZATION_FORMAT", "json")
 
+# Audit Configuration
+AUDIT_ENABLED = os.getenv("AUDIT_ENABLED", "true").lower() == "true"
+
+# Backend de auditoría: "sqlite" (default) o "postgres"
+AUDIT_BACKEND = os.getenv("AUDIT_BACKEND", "sqlite").lower()
+
+# SQLite: ruta al archivo .db
+AUDIT_DB_PATH = os.getenv("AUDIT_DB_PATH", "data/audit.db")
+
+# PostgreSQL: DSN completo (usado cuando AUDIT_BACKEND=postgres)
+# Formato: postgresql://user:password@host:5432/dbname
+# Alternativa con SSL: postgresql://user:pass@host/db?ssl=require
+POSTGRES_DSN = os.getenv("POSTGRES_DSN", None)
+
 # Validaciones
 if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
     raise ValueError(
