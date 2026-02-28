@@ -58,12 +58,12 @@ class AuditService:
                 model_id=model_id,
                 prompt_versions=registry.get_all_current_versions(),
             )
-            # Persistir la sesión vacía para que sea visible aunque la app cierre antes
-            # de que se genere el primer record
+            # Persistir la sesión vacía para que sea visible aunque la app
+            # cierre antes de que se genere el primer record
             await self._storage.upsert_session(self._sessions[session_id])
 
     async def _persist(self, record: AuditRecord) -> None:
-        """Guarda el record y actualiza el resumen de sesión. Silencia errores."""
+        """Guarda el record y actualiza el resumen de sesión."""
         try:
             await self._storage.save_record(record)
 
@@ -327,38 +327,27 @@ _service: Optional[AuditService] = None
 
 
 def _build_storage() -> BaseAuditStorage:
-    """
-    Factory de storage que lee la configuración en runtime.
-    Soporta AUDIT_BACKEND=sqlite (default) o AUDIT_BACKEND=postgres.
-    """
-    from src.config import AUDIT_BACKEND, AUDIT_DB_PATH, POSTGRES_DSN
-
-    backend = (AUDIT_BACKEND or "sqlite").lower().strip()
-
-    if backend == "postgres":
-        if not POSTGRES_DSN:
-            raise ValueError(
-                "AUDIT_BACKEND=postgres requiere que POSTGRES_DSN "
-                "esté definido en .env\n"
-                "Ejemplo: POSTGRES_DSN=postgresql://user:pass@host:5432/dbname"
-            )
-        from .storage.postgres_storage import PostgresAuditStorage
-        return PostgresAuditStorage(dsn=POSTGRES_DSN)
-
-    # Default: SQLite
-    from .storage.sqlite_storage import SQLiteAuditStorage
-    return SQLiteAuditStorage(db_path=AUDIT_DB_PATH)
+    """Factory: CloudWatch Logs + Metrics (serverless, sin DB relacional)."""
+    from src.config import (
+        AWS_REGION,
+        CW_LOG_GROUP_RECORDS,
+        CW_LOG_GROUP_SESSIONS,
+        CW_RETENTION_DAYS,
+    )
+    from .storage.cloudwatch_storage import CloudWatchAuditStorage
+    return CloudWatchAuditStorage(
+        region=AWS_REGION,
+        log_group_records=CW_LOG_GROUP_RECORDS,
+        log_group_sessions=CW_LOG_GROUP_SESSIONS,
+        retention_days=CW_RETENTION_DAYS,
+    )
 
 
 async def get_audit_service() -> AuditService:
     """
     Retorna el singleton de AuditService.
-    Inicializa el backend la primera vez que se llama.
+    Inicializa el backend CloudWatch la primera vez que se llama.
     Thread-safe en un único event loop (asyncio standard).
-
-    El backend se selecciona via AUDIT_BACKEND en .env:
-        AUDIT_BACKEND=sqlite   → SQLite local (default)
-        AUDIT_BACKEND=postgres → PostgreSQL via asyncpg
     """
     global _service
     if _service is None:

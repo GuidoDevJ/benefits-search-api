@@ -19,7 +19,7 @@ try:
     from .clasify_intent import get_filter
     from .nlp_processor import Entities, nlp_pipeline
     from .normalizar import normalize_promo
-    from .s3_unhandled_queries import get_s3_service
+    from .cloudwatch_unhandled_queries import get_cw_service
     from .push_notifications import send_push_notification
     from ..cache import get_cache_service
     from ..config import CACHE_ENABLED
@@ -34,7 +34,7 @@ except ImportError:
     from src.tools.clasify_intent import get_filter
     from src.tools.nlp_processor import Entities, nlp_pipeline
     from src.tools.normalizar import normalize_promo
-    from src.tools.s3_unhandled_queries import get_s3_service
+    from src.tools.cloudwatch_unhandled_queries import get_cw_service
     from src.tools.push_notifications import send_push_notification
     from src.cache import get_cache_service
     from src.config import CACHE_ENABLED
@@ -277,7 +277,7 @@ async def search_benefits_async(query: str) -> dict:
 
         # Guardar en S3
         try:
-            s3_service = await get_s3_service()
+            s3_service = await get_cw_service()
             await s3_service.save_unhandled_query(
                 query=query,
                 detected_intent=nlp_result.intent,
@@ -285,7 +285,7 @@ async def search_benefits_async(query: str) -> dict:
                 reason="no_entities_detected",
             )
         except Exception as s3_error:
-            print(f"[S3] Error guardando query sin entidades: {s3_error}")
+            print(f"[CW] Error guardando query sin entidades: {s3_error}")
 
         # Enviar push notification
         try:

@@ -20,7 +20,7 @@ from ..config import AUDIT_ENABLED, BEDROCK_MODEL_ID
 from ..graph import create_multiagent_graph
 from ..tools.nlp_processor import nlp_pipeline
 from ..tools.push_notifications import send_push_notification
-from ..tools.s3_unhandled_queries import get_s3_service
+from ..tools.cloudwatch_unhandled_queries import get_cw_service
 
 
 def _extract_response(result: dict) -> str:
@@ -74,7 +74,7 @@ async def chat_function(
 
         if nlp_result.intent == "unknown":
             try:
-                s3_service = await get_s3_service()
+                s3_service = await get_cw_service()
                 await s3_service.save_unhandled_query(
                     query=message,
                     detected_intent=nlp_result.intent,
@@ -82,7 +82,7 @@ async def chat_function(
                     reason="unknown_intent",
                 )
             except Exception as s3_err:
-                print(f"[S3] Error guardando query: {s3_err}")
+                print(f"[CW] Error guardando query: {s3_err}")
 
             try:
                 await send_push_notification(

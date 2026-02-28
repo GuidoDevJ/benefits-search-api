@@ -1,5 +1,4 @@
 from .base import BaseAuditStorage
-from .postgres_storage import PostgresAuditStorage
-from .sqlite_storage import SQLiteAuditStorage
+from .cloudwatch_storage import CloudWatchAuditStorage
 
-__all__ = ["BaseAuditStorage", "SQLiteAuditStorage", "PostgresAuditStorage"]
+__all__ = ["BaseAuditStorage", "CloudWatchAuditStorage"]
