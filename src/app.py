@@ -69,7 +69,8 @@ def main():
             server_port=args.port,
             share=args.share,
             debug=args.debug,
-            show_error=True
+            show_error=True,
+            show_api=False,
         )
     except KeyboardInterrupt:
         print("\n\n👋 Servidor detenido. ¡Hasta luego!")

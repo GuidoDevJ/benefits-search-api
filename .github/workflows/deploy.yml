@@ -1,0 +1,87 @@
+name: Deploy to Amazon ECS
+
+on:
+  push:
+    branches: [master]
+
+# ── Variables que NO cambian entre entornos ──────────────────────────────────
+env:
+  AWS_REGION:               us-east-1
+  ECR_REPOSITORY:           comafi-ai          # nombre del repositorio ECR
+  ECS_CLUSTER:              comafi-cluster      # nombre del cluster ECS
+  ECS_SERVICE:              comafi-service      # nombre del servicio ECS
+  CONTAINER_NAME:           comafi-api          # nombre del contenedor en la task def
+  TASK_DEFINITION_FAMILY:   comafi-api          # familia de la task definition
+
+# ── OIDC: permite que GitHub Actions asuma un rol IAM sin credenciales ───────
+permissions:
+  id-token: write   # necesario para el token OIDC
+  contents: read
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Auth AWS vía OIDC (sin AWS_ACCESS_KEY_ID en secrets) ─────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:        ${{ env.AWS_REGION }}
+          role-session-name: github-${{ github.run_id }}
+
+      # ── 3. Login ECR ─────────────────────────────────────────────────────────
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── 4. Docker Buildx (cache en GitHub Actions) ───────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── 5. Build + Push con cache de layers ──────────────────────────────────
+      - name: Build, tag and push image to ECR
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context:    .
+          push:       true
+          provenance: false          # evita manifests multi-arch inesperados en ECR
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      # ── 6. Descargar la task definition actual desde ECS ─────────────────────
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ env.TASK_DEFINITION_FAMILY }}" \
+            --query taskDefinition \
+            > task-definition.json
+
+      # ── 7. Actualizar la imagen en la task definition ─────────────────────────
+      - name: Render updated task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition:  task-definition.json
+          container-name:   ${{ env.CONTAINER_NAME }}
+          image:            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      # ── 8. Registrar nueva revisión y hacer rolling deploy ────────────────────
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition:          ${{ steps.task-def.outputs.task-definition }}
+          service:                  ${{ env.ECS_SERVICE }}
+          cluster:                  ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          wait-for-minutes:         15
