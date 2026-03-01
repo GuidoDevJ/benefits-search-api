@@ -46,9 +46,11 @@ ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONFAULTHANDLER=1 \
     PYTHONPATH=/app \
-    # Uvicorn — sobreescribibles vía ECS task definition env vars
+    # Uvicorn — sobreescribibles vía ECS task definition env vars.
+    # WORKERS=1 requerido mientras Gradio esté montado (WebSockets con estado en memoria).
+    # Para escalar: aumentar tasks ECS con sticky sessions en ALB, no workers.
     PORT=8000 \
-    WORKERS=2
+    WORKERS=1
 
 # Usuario no-root con UID/GID fijos para auditoría y compatibilidad con EFS
 RUN groupadd -r -g 1001 appgroup && \

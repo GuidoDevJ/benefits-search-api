@@ -241,6 +241,88 @@ Tracing automático de las llamadas LangChain. No es necesario para que el siste
 
 ## 9. Despliegue en AWS ECS (producción)
 
+### 9.0 Puertos y rutas de la aplicación
+
+Con Gradio montado dentro de FastAPI, **todo corre en el puerto 8000**:
+
+| Ruta | Qué sirve |
+|---|---|
+| `GET /` | Health check (responde 200 siempre) |
+| `POST /benefits` | API REST — consulta al agente |
+| `GET /audit/session/{id}` | Detalle de sesión auditada |
+| `GET /chat` | Interfaz Gradio (chat web) |
+| `GET /chat/queue/join` | WebSocket interno de Gradio |
+
+> No se expone el puerto 7860. El puerto 8000 sirve todo.
+
+---
+
+### 9.0.1 Puertos que necesitás abrir
+
+#### Security Group — Application Load Balancer (`sg-alb-comafi`)
+
+| Tipo | Protocolo | Puerto | Origen | Para qué |
+|---|---|---|---|---|
+| Inbound | TCP | 80 | `0.0.0.0/0` | HTTP (redirigir a 443 o usar directo para testing) |
+| Inbound | TCP | 443 | `0.0.0.0/0` | HTTPS (producción con ACM cert) |
+| Outbound | TCP | 8000 | `sg-ecs-comafi` | Forward hacia los tasks |
+
+#### Security Group — ECS Tasks (`sg-ecs-comafi`)
+
+| Tipo | Protocolo | Puerto | Origen | Para qué |
+|---|---|---|---|---|
+| Inbound | TCP | 8000 | `sg-alb-comafi` | Tráfico del ALB (FastAPI + Gradio + WebSocket) |
+| Outbound | TCP | 443 | `0.0.0.0/0` | Llamadas a AWS Bedrock, CloudWatch, TeVaBien API |
+| Outbound | TCP | 6379 | (SG de Redis / ElastiCache) | Caché (si usás Redis) |
+
+> **Solo el ALB tiene IP pública. Los tasks ECS van en subnets privadas.**
+> El SG de los tasks no tiene inbound desde internet, solo desde el ALB.
+
+---
+
+### 9.0.2 ALB — Configuración del Target Group
+
+```
+Target group name:  comafi-tg
+Target type:        IP (requerido para Fargate)
+Protocol:           HTTP
+Port:               8000
+VPC:                la misma que el ECS cluster
+
+Health check:
+  Protocol:         HTTP
+  Path:             /
+  Healthy threshold:    2
+  Unhealthy threshold:  3
+  Timeout:          10s
+  Interval:         30s
+  Success codes:    200
+```
+
+#### Sticky Sessions (obligatorio para Gradio)
+
+Gradio usa WebSockets con estado en memoria. El ALB debe rutear todas
+las requests de la misma sesión al mismo task ECS.
+
+```
+Ir a: Target Group → Attributes → Edit
+  Stickiness:           Enabled
+  Stickiness type:      Load balancer generated cookie
+  Stickiness duration:  1 day
+```
+
+#### ALB Listener
+
+```
+Puerto 80  → Forward a comafi-tg  (testing)
+Puerto 443 → Forward a comafi-tg  (producción, requiere cert ACM en el listener)
+```
+
+> Para testing rápido sin dominio: usar el DNS del ALB directamente en puerto 80.
+> URL final: `http://comafi-alb-XXXXXXX.us-east-1.elb.amazonaws.com/chat`
+
+---
+
 ### 9.1 Infraestructura requerida
 
 Antes de ejecutar el pipeline, crear manualmente (o vía IaC):

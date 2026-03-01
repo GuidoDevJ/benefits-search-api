@@ -1,18 +1,18 @@
 """
-FastAPI — Endpoint REST para el sistema de búsqueda de beneficios.
+FastAPI — API REST + Gradio UI para el sistema de búsqueda de beneficios.
 
-Cambios respecto a la versión original:
-  - Genera un session_id (UUID) por request.
-  - Registra input del usuario, respuesta final y errores en AuditService.
-  - Retorna el session_id en la respuesta para trazabilidad.
-  - Si AUDIT_ENABLED=false, audit_service es None y el comportamiento
-    es idéntico a la versión sin audit.
+Rutas:
+  GET  /           → health check
+  POST /benefits   → API REST (JSON)
+  GET  /audit/session/{id} → detalle de sesión auditada
+  GET  /chat       → interfaz Gradio (montada como sub-app)
 """
 
 import time
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
+import gradio as gr
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -21,6 +21,8 @@ from pydantic import BaseModel
 
 from ..config import AUDIT_ENABLED, BEDROCK_MODEL_ID
 from ..graph import create_multiagent_graph
+from ..ui.audit_interface import create_audit_interface
+from ..ui.chat_interface import create_chat_interface
 
 
 class QueryRequest(BaseModel):
@@ -33,12 +35,18 @@ async def lifespan(app: FastAPI):
     if AUDIT_ENABLED:
         from ..audit.audit_service import get_audit_service
         await get_audit_service()
-        print("[AUDIT] Base de datos inicializada.")
+        print("[AUDIT] CloudWatch inicializado.")
     yield
     print("App cerrando")
 
 
 app = FastAPI(lifespan=lifespan)
+
+# ── Gradio montado en /chat y /audit-ui ─────────────────────────────────────
+# Ambas interfaces corren en el mismo proceso uvicorn en el puerto 8000.
+# WebSockets de Gradio requieren WORKERS=1 o sticky sessions en el ALB.
+app = gr.mount_gradio_app(app, create_chat_interface(), path="/chat")
+app = gr.mount_gradio_app(app, create_audit_interface(), path="/audit-ui")
 
 app.add_middleware(
     CORSMiddleware,
@@ -86,19 +94,25 @@ async def get_audit_session(session_id: str):
 
     Response:
         {
-            "session":  { ...SessionSummary... },
-            "records":  [ ...AuditRecord... ]
+            "session": { ...SessionSummary... },
+            "records": [ ...AuditRecord... ]
         }
     """
     if not AUDIT_ENABLED:
-        raise HTTPException(status_code=503, detail="Audit deshabilitado (AUDIT_ENABLED=false)")
+        raise HTTPException(
+            status_code=503,
+            detail="Audit deshabilitado (AUDIT_ENABLED=false)",
+        )
 
     from ..audit.audit_service import get_audit_service
     svc = await get_audit_service()
 
     summary = await svc.get_session(session_id)
     if summary is None:
-        raise HTTPException(status_code=404, detail=f"Sesión '{session_id}' no encontrada")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Sesión '{session_id}' no encontrada",
+        )
 
     records = await svc.get_session_records(session_id)
 
