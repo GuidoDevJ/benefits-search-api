@@ -46,6 +46,9 @@ ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONFAULTHANDLER=1 \
     PYTHONPATH=/app \
+    # Matplotlib (usado internamente por Gradio) necesita un dir escribible.
+    # Sin home dir el usuario no-root no puede usar ~/.config/matplotlib.
+    MPLCONFIGDIR=/tmp/matplotlib \
     # Uvicorn — sobreescribibles vía ECS task definition env vars.
     # WORKERS=1 requerido mientras Gradio esté montado (WebSockets con estado en memoria).
     # Para escalar: aumentar tasks ECS con sticky sessions en ALB, no workers.
