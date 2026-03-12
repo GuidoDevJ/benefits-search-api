@@ -20,7 +20,7 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 CACHE_ENABLED = os.getenv("CACHE_ENABLED", "true").lower() == "true"
 
 # Serialization Format for LLM communication ("json" or "toon")
-SERIALIZATION_FORMAT = os.getenv("SERIALIZATION_FORMAT", "json")
+SERIALIZATION_FORMAT = os.getenv("SERIALIZATION_FORMAT", "toon")
 
 # Audit Configuration
 AUDIT_ENABLED = os.getenv("AUDIT_ENABLED", "true").lower() == "true"

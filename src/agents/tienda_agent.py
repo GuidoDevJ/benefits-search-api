@@ -1,20 +1,26 @@
 """
-Benefits Agent — Agente async especializado en búsqueda de beneficios.
+Tienda Agent — Agente async especializado en búsqueda de productos en Tienda Comafi.
 
-Cambios respecto a la versión original:
+Sigue el mismo patrón que benefits_agent:
   - Carga el system prompt desde PromptRegistry (versionado + hash).
   - Acepta `session_id` y `audit_service` opcionales para auditoría.
-  - Registra cada llamada LLM (incluidas las del loop de tool execution).
-  - Registra cada ejecución de tool con latencia.
-  - Si audit_service es None, funciona exactamente igual que antes.
+  - Registra cada llamada LLM y ejecución de tool con latencia.
+  - Si audit_service es None, funciona igual que antes.
 """
+
+from __future__ import annotations
 
 import json
 import time
 from typing import TYPE_CHECKING, Optional
 
 from langchain_aws import ChatBedrock
-from langchain_core.messages import BaseMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 from src.audit.models import TokenUsage
 from src.audit.prompt_registry import get_prompt_registry
@@ -24,9 +30,9 @@ if TYPE_CHECKING:
     from src.audit.audit_service import AuditService
 
 try:
-    from ..tools.benefits_api import search_benefits, search_benefits_async
+    from ..tools.tienda_api import search_tienda, search_tienda_async
 except ImportError:
-    from src.tools.benefits_api import search_benefits, search_benefits_async
+    from src.tools.tienda_api import search_tienda, search_tienda_async
 
 try:
     from .base_agent import AgentState
@@ -34,17 +40,17 @@ except ImportError:
     from src.agents.base_agent import AgentState
 
 
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Helpers
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def _messages_to_dict(messages: list[BaseMessage]) -> list[dict]:
-    """Convierte mensajes LangChain a dicts serializables para auditoría."""
     result = []
     for msg in messages:
         role = msg.__class__.__name__.replace("Message", "").lower()
         content = (
-            msg.content if isinstance(msg.content, str) else str(msg.content)
+            msg.content if isinstance(msg.content, str)
+            else str(msg.content)
         )
         entry: dict = {"role": role, "content": content[:2000]}
         if hasattr(msg, "tool_calls") and msg.tool_calls:
@@ -59,77 +65,58 @@ def _messages_to_dict(messages: list[BaseMessage]) -> list[dict]:
 
 
 def _extract_token_usage(response) -> Optional[TokenUsage]:
-    """Extrae token usage de un AIMessage (usage_metadata o response_metadata)."""
     try:
         return TokenUsage.from_response(response)
     except Exception:
         return None
 
 
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Factory
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-def create_benefits_agent(llm: ChatBedrock):
+def create_tienda_agent(
+    llm: ChatBedrock,
+    session_id: Optional[str] = None,
+    audit_service: Optional["AuditService"] = None,
+):
     """
-    Crea el nodo async del agente de beneficios.
-    session_id y audit_service se leen del estado del grafo por request.
+    Crea el nodo async del agente de Tienda Comafi.
 
     Args:
-        llm: Modelo de lenguaje.
+        llm           : Modelo de lenguaje.
+        session_id    : ID de sesión para auditoría (opcional).
+        audit_service : Servicio de auditoría (opcional).
     """
     registry = get_prompt_registry()
-    prompt_version = registry.get("benefits")
+    prompt_version = registry.get("tienda")
 
-    tools = [search_benefits]
+    tools = [search_tienda]
     tool_map = {tool.name: tool for tool in tools}
     model_id: str = getattr(llm, "model_id", "unknown")
 
-    # Computar una sola vez: serializer, llm con tools, y base del system prompt
-    serializer = get_serializer()
-    llm_with_tools = llm.bind_tools(tools)
-    _base_system_content = prompt_version.content
-    _format_hint = serializer.get_format_instruction()
-    if _format_hint:
-        _base_system_content = f"{_base_system_content}\n\n{_format_hint}"
-
-    async def benefits_agent_node(state: AgentState):
-        session_id = state.get("session_id")
-        audit_service = state.get("audit_service")
+    async def tienda_agent_node(state: AgentState):
         messages: list[BaseMessage] = state["messages"]
         context = state.get("context", {})
+        serializer = get_serializer()
 
-        # Solo la parte dinámica (entidades) se computa por request
-        system_content = _base_system_content
+        system_content = prompt_version.content
+        format_hint = serializer.get_format_instruction()
+        if format_hint:
+            system_content = f"{system_content}\n\n{format_hint}"
 
-        # Inyectar entidades pre-clasificadas por el LLM classifier
-        classification = context.get("classification", {})
-        categoria = classification.get("categoria_benefits")
-        dia = classification.get("dia")
-        negocio = classification.get("negocio")
-        if any([categoria, dia, negocio]):
-            entity_hints = []
-            if categoria:
-                entity_hints.append(f"categoría={categoria}")
-            if dia:
-                entity_hints.append(f"día={dia}")
-            if negocio:
-                entity_hints.append(f"negocio={negocio}")
-            system_content = (
-                f"{system_content}\n\n"
-                f"Entidades pre-clasificadas: {', '.join(entity_hints)}. "
-                f"Usá estos valores al llamar a search_benefits."
-            )
-
+        # Solo pasar HumanMessages: evita que el AIMessage de un agente
+        # anterior quede en la última posición (Bedrock rechaza tool calls
+        # cuando el último mensaje es de rol "assistant").
+        human_messages = [m for m in messages if isinstance(m, HumanMessage)]
         temp_messages: list[BaseMessage] = [
             SystemMessage(content=system_content)
-        ] + list(messages)
+        ] + human_messages
 
-        has_benefits = False
-        llm_call_num = 0
+        llm_with_tools = llm.bind_tools(tools)
+        has_tienda = False
 
-        # ── Primera llamada LLM ────────────────────────────────
-        llm_call_num += 1
+        # ── Primera llamada LLM ────────────────────────────────────────
         t0 = time.monotonic()
         response = await llm_with_tools.ainvoke(temp_messages)
         latency_ms = int((time.monotonic() - t0) * 1000)
@@ -143,17 +130,17 @@ def create_benefits_agent(llm: ChatBedrock):
             await audit_service.record_llm_call(
                 session_id=session_id,
                 model_id=model_id,
-                agent_name="benefits",
+                agent_name="tienda",
                 input_messages=_messages_to_dict(temp_messages),
                 output_content=response.content or "",
                 latency_ms=latency_ms,
                 token_usage=token_usage,
-                prompt_name="benefits",
+                prompt_name="tienda",
                 tool_calls_requested=tool_calls_req or None,
             )
-        # ───────────────────────────────────────────────────────
+        # ──────────────────────────────────────────────────────────────
 
-        # ── Loop de tool execution ─────────────────────────────
+        # ── Loop de tool execution ─────────────────────────────────────
         while hasattr(response, "tool_calls") and response.tool_calls:
             tool_messages: list[ToolMessage] = []
 
@@ -164,17 +151,16 @@ def create_benefits_agent(llm: ChatBedrock):
                 if tool_name not in tool_map:
                     continue
 
-                # ── Ejecutar tool con medición de latencia ─────
                 tool_error: Optional[Exception] = None
                 tool_result = None
                 t_tool = time.monotonic()
+
                 try:
-                    if tool_name == "search_benefits":
-                        tool_result = await search_benefits_async(
+                    if tool_name == "search_tienda":
+                        tool_result = await search_tienda_async(
                             query=tool_args.get("query", ""),
-                            categoria=tool_args.get("categoria", categoria),
-                            dia=tool_args.get("dia", dia),
-                            negocio=tool_args.get("negocio", negocio),
+                            precio_max=tool_args.get("precio_max"),
+                            categoria=tool_args.get("categoria"),
                         )
                     else:
                         tool_result = await tool_map[tool_name].ainvoke(
@@ -186,28 +172,23 @@ def create_benefits_agent(llm: ChatBedrock):
                 finally:
                     tool_latency_ms = int((time.monotonic() - t_tool) * 1000)
 
-                # Detectar si hay beneficios en el resultado
-                if tool_name == "search_benefits" and tool_result:
+                # Detectar si hay productos en el resultado
+                if tool_name == "search_tienda" and tool_result:
                     try:
                         rd = (
-                            tool_result
-                            if isinstance(tool_result, dict)
+                            tool_result if isinstance(tool_result, dict)
                             else json.loads(tool_result)
                         )
-                        benefits_list = rd.get("data", [])
-                        has_benefits = (
-                            isinstance(benefits_list, list)
-                            and len(benefits_list) > 0
-                        )
+                        has_tienda = bool(rd.get("data"))
                     except Exception:
-                        has_benefits = False
+                        has_tienda = False
 
-                # ── Auditar ejecución del tool ─────────────────
+                # ── Auditar ejecución del tool ─────────────────────────
                 if audit_service and session_id:
                     await audit_service.record_tool_execution(
                         session_id=session_id,
                         model_id=model_id,
-                        agent_name="benefits",
+                        agent_name="tienda",
                         tool_name=tool_name,
                         tool_args=tool_args,
                         tool_result=tool_result,
@@ -215,7 +196,7 @@ def create_benefits_agent(llm: ChatBedrock):
                         is_error=tool_error is not None,
                         error=tool_error,
                     )
-                # ───────────────────────────────────────────────
+                # ───────────────────────────────────────────────────────
 
                 tool_content = serializer.serialize(tool_result)
                 tool_messages.append(
@@ -225,11 +206,9 @@ def create_benefits_agent(llm: ChatBedrock):
                     )
                 )
 
-            # Agregar response + tool_messages y reinvocar
             temp_messages = temp_messages + [response] + tool_messages
 
-            # ── Llamada LLM post-tool ──────────────────────────
-            llm_call_num += 1
+            # ── Llamada LLM post-tool ──────────────────────────────────
             t0 = time.monotonic()
             response = await llm_with_tools.ainvoke(temp_messages)
             latency_ms = int((time.monotonic() - t0) * 1000)
@@ -243,17 +222,17 @@ def create_benefits_agent(llm: ChatBedrock):
                 await audit_service.record_llm_call(
                     session_id=session_id,
                     model_id=model_id,
-                    agent_name="benefits",
+                    agent_name="tienda",
                     input_messages=_messages_to_dict(temp_messages),
                     output_content=response.content or "",
                     latency_ms=latency_ms,
                     token_usage=token_usage,
-                    prompt_name="benefits",
+                    prompt_name="tienda",
                     tool_calls_requested=tool_calls_req or None,
                 )
-            # ───────────────────────────────────────────────────
+            # ───────────────────────────────────────────────────────────
 
-        context["has_benefits"] = has_benefits
+        context["has_tienda"] = has_tienda
         return {"messages": [response], "context": context}
 
-    return benefits_agent_node
+    return tienda_agent_node

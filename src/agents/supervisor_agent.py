@@ -44,32 +44,37 @@ def _extract_token_usage(response) -> Optional[TokenUsage]:
 def create_supervisor_agent(
     llm: ChatBedrock,
     agents: list[str],
-    session_id: Optional[str] = None,
-    audit_service: Optional["AuditService"] = None,
 ):
     """
     Crea el nodo async del supervisor.
+    session_id y audit_service se leen del estado del grafo por request.
 
     Args:
-        llm           : Modelo de lenguaje.
-        agents        : Lista de nombres de agentes disponibles.
-        session_id    : ID de sesión para auditoría (opcional).
-        audit_service : Servicio de auditoría (opcional).
+        llm    : Modelo de lenguaje.
+        agents : Lista de nombres de agentes disponibles.
     """
     registry = get_prompt_registry()
     prompt_version = registry.get("supervisor")
     agents_str = ", ".join(agents)
-    system_prompt = prompt_version.render(agents_str=agents_str)
-
     model_id: str = getattr(llm, "model_id", "unknown")
 
     async def supervisor_node(state):
+        session_id = state.get("session_id")
+        audit_service = state.get("audit_service")
+
         context = state.get("context", {})
         has_benefits = context.get("has_benefits", None)
 
-        # Si benefits ya ejecutó (cualquier resultado), finalizar
+        # Construir descripción del estado actual para el prompt
+        done = []
         if has_benefits is not None:
-            return {"next": "finish"}
+            done.append(f"benefits ejecutó (encontró resultados: {has_benefits})")
+        context_str = "; ".join(done) if done else "ningún agente ejecutó todavía"
+
+        system_prompt = prompt_version.render(
+            agents_str=agents_str,
+            context_str=context_str,
+        )
 
         messages: list[BaseMessage] = state["messages"]
         full_messages = [SystemMessage(content=system_prompt)] + messages

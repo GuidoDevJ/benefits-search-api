@@ -1,4 +1,4 @@
-from typing import TypedDict, Annotated
+from typing import Any, TypedDict, Annotated, Optional
 from langchain_aws import ChatBedrock
 from langchain_core.messages import (
     BaseMessage,
@@ -16,6 +16,8 @@ class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], operator.add]
     next: str
     context: dict
+    session_id: Optional[str]
+    audit_service: Optional[Any]
 
 
 def create_agent(llm: ChatBedrock, tools: list, system_prompt: str):

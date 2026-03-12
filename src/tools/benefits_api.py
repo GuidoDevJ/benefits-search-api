@@ -17,12 +17,10 @@ from pydantic import BaseModel
 # Local imports
 try:
     from .clasify_intent import get_filter
-    from .nlp_processor import Entities, nlp_pipeline
     from .normalizar import normalize_promo
-    from .cloudwatch_unhandled_queries import get_cw_service
-    from .push_notifications import send_push_notification
     from ..cache import get_cache_service
     from ..config import CACHE_ENABLED
+    from ..models.typed_entities import Entities
 except ImportError:
     import sys
     from pathlib import Path
@@ -32,12 +30,10 @@ except ImportError:
         sys.path.insert(0, str(_root))
 
     from src.tools.clasify_intent import get_filter
-    from src.tools.nlp_processor import Entities, nlp_pipeline
     from src.tools.normalizar import normalize_promo
-    from src.tools.cloudwatch_unhandled_queries import get_cw_service
-    from src.tools.push_notifications import send_push_notification
     from src.cache import get_cache_service
     from src.config import CACHE_ENABLED
+    from src.models.typed_entities import Entities
 
 
 class BenefitItem(BaseModel):
@@ -259,53 +255,41 @@ async def fetch_benefits(
         )
 
 
-async def search_benefits_async(query: str) -> dict:
+async def search_benefits_async(
+    query: str,
+    categoria: Optional[str] = None,
+    dia: Optional[str] = None,
+    negocio: Optional[str] = None,
+) -> dict:
     """
-    Busca beneficios.
+    Busca beneficios usando entidades pre-extraídas por el LLM classifier.
 
     Args:
-        query: Consulta en lenguaje natural
+        query    : Consulta original del usuario (para logging).
+        categoria: Categoría TeVaBien (ej: "gastronomia", "supermercados").
+        dia      : Día de la semana en español (ej: "lunes").
+        negocio  : Nombre de comercio específico (ej: "carrefour").
 
     Returns:
-        dict con el resultado de la búsqueda
+        dict con clave "data" (lista de beneficios normalizados).
     """
-    nlp_result = await asyncio.to_thread(nlp_pipeline, query)
+    entities = Entities(
+        categoria=categoria,
+        dia=dia,
+        negocio=negocio,
+    )
 
-    entities_dict = nlp_result.entities.model_dump(exclude_none=True)
-    if not entities_dict:
-        print("[search_benefits] No entities detected - returning empty")
+    print(
+        f"[search_benefits] query='{query}' | "
+        f"categoria={categoria}, dia={dia}, negocio={negocio}"
+    )
 
-        # Guardar en S3
-        try:
-            s3_service = await get_cw_service()
-            await s3_service.save_unhandled_query(
-                query=query,
-                detected_intent=nlp_result.intent,
-                entities=entities_dict,
-                reason="no_entities_detected",
-            )
-        except Exception as s3_error:
-            print(f"[CW] Error guardando query sin entidades: {s3_error}")
+    response = await fetch_benefits(entities)
 
-        # Enviar push notification
-        try:
-            await send_push_notification(
-                f"Query sin entidades detectadas: {query}"
-            )
-        except Exception as push_error:
-            print(f"[Push] Error enviando notificación: {push_error}")
-
-        return {
-            "data": [],
-            "error": "No se detectaron entidades en la consulta",
-        }
-
-    response = await fetch_benefits(nlp_result.entities)
-
-    # Limitar a máximo 5 beneficios para reducir tokens enviados al LLM
-    datas_json = []
-    for benefit in (response.data or [])[:5]:
-        datas_json.append(normalize_promo(benefit.model_dump()))
+    datas_json = [
+        normalize_promo(b.model_dump())
+        for b in (response.data or [])[:5]
+    ]
 
     result: dict = {"data": datas_json}
     if response.error:
@@ -314,24 +298,32 @@ async def search_benefits_async(query: str) -> dict:
 
 
 @tool
-def search_benefits(query: str) -> dict:
+def search_benefits(
+    query: str,
+    categoria: Optional[str] = None,
+    dia: Optional[str] = None,
+    negocio: Optional[str] = None,
+) -> dict:
     """
-    Busca beneficios en la API de TeVaBien basándose en una consulta.
-
-    Esta herramienta:
-    1. Procesa la consulta con NLP para extraer entidades
-    2. Construye los parámetros de filtro
-    3. Realiza la petición a la API
-    4. Retorna los beneficios encontrados
+    Busca beneficios y descuentos TeVaBien con tarjeta Comafi.
 
     Args:
-        query: Consulta en lenguaje natural (ej: "descuentos en supermercados")
+        query    : Consulta del usuario en lenguaje natural.
+        categoria: Categoría del comercio. Opciones: belleza, vehiculos,
+                   supermercados, librerias, combustible, moda, turismo,
+                   vinotecas, hogar/deco, promos del mes, e-commerce,
+                   gastronomia, salud, transporte, jugueterias,
+                   entretenimiento.
+        dia      : Día de la semana (lunes, martes, miercoles, jueves,
+                   viernes, sabado, domingo).
+        negocio  : Nombre de un comercio específico (ej: carrefour, ypf).
 
     Returns:
-        dict con el resultado de la búsqueda
+        dict con lista de beneficios: comercio, descuento, medio de pago.
     """
-    # Wrapper sync que ejecuta la versión async
-    return asyncio.run(search_benefits_async(query))
+    return asyncio.run(
+        search_benefits_async(query, categoria, dia, negocio)
+    )
 
 
 # Demo

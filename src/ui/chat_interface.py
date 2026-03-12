@@ -17,8 +17,9 @@ import gradio as gr
 from langchain_core.messages import HumanMessage
 
 from ..config import AUDIT_ENABLED, BEDROCK_MODEL_ID
-from ..graph import create_multiagent_graph
-from ..tools.nlp_processor import nlp_pipeline
+from ..graph import get_graph
+from ..tools.nlp_processor import is_valid_query
+from ..tools.llm_classifier import classify_query
 from ..tools.push_notifications import send_push_notification
 from ..tools.cloudwatch_unhandled_queries import get_cw_service
 
@@ -61,24 +62,52 @@ async def chat_function(
         audit_service = await get_audit_service()
 
     try:
-        nlp_result = nlp_pipeline(message)
-        nlp_dict = nlp_result.model_dump()
+        # ── 1. Validación rápida con spaCy (solo detecta gibberish) ────
+        if not is_valid_query(message):
+            resp = (
+                "No pude entender tu consulta. "
+                "Podés preguntarme sobre:\n"
+                "• Descuentos y beneficios: gastronomía, supermercados, "
+                "entretenimiento, etc.\n"
+                "• Productos para comprar en Tienda Comafi: electrónica, "
+                "ropa, deportes, etc."
+            )
+            if audit_service:
+                await audit_service.record_user_input(
+                    session_id=session_id,
+                    model_id=BEDROCK_MODEL_ID,
+                    query=message,
+                    nlp_result={"intent": "invalid", "entities": {}},
+                )
+                total_ms = int((time.monotonic() - t_start) * 1000)
+                await audit_service.record_final_response(
+                    session_id=session_id,
+                    model_id=BEDROCK_MODEL_ID,
+                    response=resp,
+                    total_latency_ms=total_ms,
+                )
+            return resp, session_id
+
+        # ── 2. Clasificación LLM: intent + entidades ───────────────────
+        classification = await classify_query(message)
+        classification_dict = classification.model_dump()
 
         if audit_service:
             await audit_service.record_user_input(
                 session_id=session_id,
                 model_id=BEDROCK_MODEL_ID,
                 query=message,
-                nlp_result=nlp_dict,
+                nlp_result=classification_dict,
             )
 
-        if nlp_result.intent == "unknown":
+        # ── 3. Rechazar intents desconocidos (con logging) ─────────────
+        if classification.intent == "unknown":
             try:
                 s3_service = await get_cw_service()
                 await s3_service.save_unhandled_query(
                     query=message,
-                    detected_intent=nlp_result.intent,
-                    entities=nlp_result.entities.model_dump(),
+                    detected_intent="unknown",
+                    entities={},
                     reason="unknown_intent",
                 )
             except Exception as s3_err:
@@ -92,12 +121,13 @@ async def chat_function(
                 print(f"[Push] Error: {push_err}")
 
             resp = (
-                "No pude identificar tu consulta. "
-                "Intenta preguntarme sobre promociones, descuentos o "
-                "beneficios en categorías como gastronomía, supermercados, "
-                "entretenimiento, etc."
+                "No puedo ayudarte con eso. "
+                "Podés preguntarme sobre:\n"
+                "• Descuentos y beneficios: gastronomía, supermercados, "
+                "entretenimiento, etc.\n"
+                "• Productos para comprar en Tienda Comafi: electrónica, "
+                "ropa, deportes, etc."
             )
-
             if audit_service:
                 total_ms = int((time.monotonic() - t_start) * 1000)
                 await audit_service.record_final_response(
@@ -106,18 +136,16 @@ async def chat_function(
                     response=resp,
                     total_latency_ms=total_ms,
                 )
-
             return resp, session_id
 
-        graph = create_multiagent_graph(
-            session_id=session_id,
-            audit_service=audit_service,
-        )
-        result = await graph.ainvoke(
+        # ── 4. Invocar grafo con entidades pre-clasificadas ────────────
+        result = await get_graph().ainvoke(
             {
                 "messages": [HumanMessage(content=message)],
                 "next": "",
-                "context": {"nlp_result": nlp_dict},
+                "context": {"classification": classification_dict},
+                "session_id": session_id,
+                "audit_service": audit_service,
             }
         )
         response_content = _extract_response(result)
@@ -154,11 +182,11 @@ def create_chat_interface() -> gr.Blocks:
     Incluye panel de trazabilidad con el session_id de cada consulta.
     """
     examples = [
+        "quiero comprar zapatillas",
+        "busco una notebook",
         "promociones en supermercados",
         "descuentos en restaurantes",
-        "beneficios en gastronomía",
         "ofertas en entretenimiento",
-        "promociones para viajar",
     ]
 
     with gr.Blocks(title="Asistente de Beneficios TeVaBien") as demo:
