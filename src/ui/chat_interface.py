@@ -1,12 +1,12 @@
 """
 Interfaz de chat async con Gradio para el sistema de búsqueda de beneficios.
 
-Cambios respecto a la versión original:
-  - Genera un session_id (UUID) por consulta para trazabilidad completa.
-  - Registra input, NLP result, respuesta y errores en AuditService.
-  - El session_id se muestra en el acordeón de trazabilidad para que
-    el usuario lo copie y lo use en el Audit Dashboard (replay).
-  - Si AUDIT_ENABLED=false, funciona idéntico a la versión original.
+- Genera un session_id (UUID) por consulta para trazabilidad completa.
+- Registra input, NLP result, respuesta y errores en AuditService.
+- El session_id se muestra en el acordeón de trazabilidad para que
+  el usuario lo copie y lo use en el Audit Dashboard (replay).
+- Clasificación determinística (fast_classify) con fallback a LLM.
+- Si AUDIT_ENABLED=false, funciona idéntico a la versión original.
 """
 
 import time
@@ -20,6 +20,7 @@ from ..config import AUDIT_ENABLED, BEDROCK_MODEL_ID
 from ..graph import get_graph
 from ..tools.nlp_processor import is_valid_query
 from ..tools.llm_classifier import classify_query
+from ..tools.fast_classifier import fast_classify
 from ..tools.push_notifications import send_push_notification
 from ..tools.cloudwatch_unhandled_queries import get_cw_service
 
@@ -68,9 +69,7 @@ async def chat_function(
                 "No pude entender tu consulta. "
                 "Podés preguntarme sobre:\n"
                 "• Descuentos y beneficios: gastronomía, supermercados, "
-                "entretenimiento, etc.\n"
-                "• Productos para comprar en Tienda Comafi: electrónica, "
-                "ropa, deportes, etc."
+                "entretenimiento, etc."
             )
             if audit_service:
                 await audit_service.record_user_input(
@@ -88,8 +87,10 @@ async def chat_function(
                 )
             return resp, session_id
 
-        # ── 2. Clasificación LLM: intent + entidades ───────────────────
-        classification = await classify_query(message)
+        # ── 2. Clasificación: determinístico con fallback a LLM ────────
+        classification = fast_classify(message)
+        if classification is None:
+            classification = await classify_query(message)
         classification_dict = classification.model_dump()
 
         if audit_service:
@@ -124,9 +125,7 @@ async def chat_function(
                 "No puedo ayudarte con eso. "
                 "Podés preguntarme sobre:\n"
                 "• Descuentos y beneficios: gastronomía, supermercados, "
-                "entretenimiento, etc.\n"
-                "• Productos para comprar en Tienda Comafi: electrónica, "
-                "ropa, deportes, etc."
+                "entretenimiento, etc."
             )
             if audit_service:
                 total_ms = int((time.monotonic() - t_start) * 1000)
@@ -182,15 +181,15 @@ def create_chat_interface() -> gr.Blocks:
     Incluye panel de trazabilidad con el session_id de cada consulta.
     """
     examples = [
-        "quiero comprar zapatillas",
-        "busco una notebook",
         "promociones en supermercados",
         "descuentos en restaurantes",
         "ofertas en entretenimiento",
+        "beneficios los lunes",
+        "descuentos en YPF",
     ]
 
     with gr.Blocks(title="Asistente de Beneficios TeVaBien") as demo:
-        gr.Markdown("# 🎁 Asistente de Beneficios TeVaBien")
+        gr.Markdown("# Asistente de Beneficios TeVaBien")
         gr.Markdown(
             "¡Bienvenido! Pregúntame sobre promociones, descuentos y beneficios. "
             "Puedo ayudarte a encontrar ofertas en gastronomía, entretenimiento, "
@@ -210,7 +209,7 @@ def create_chat_interface() -> gr.Blocks:
 
         gr.Examples(examples=examples, inputs=msg_input)
 
-        with gr.Accordion("🔍 Trazabilidad de sesión", open=False):
+        with gr.Accordion("Trazabilidad de sesión", open=False):
             gr.Markdown(
                 "Copia el **Session ID** para hacer replay en el "
                 "Audit Dashboard (`python -m src.audit_app`)."

@@ -20,7 +20,7 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel
 
 from ..config import AUDIT_ENABLED, BEDROCK_MODEL_ID
-from ..graph import create_multiagent_graph
+from ..graph import get_graph
 from ..ui.audit_interface import create_audit_interface
 from ..ui.chat_interface import create_chat_interface
 
@@ -149,17 +149,11 @@ async def get_benefits(query: QueryRequest):
 
     print(f"[API] session={session_id[:8]} query={query.query!r}")
     try:
-        graph = create_multiagent_graph(
-            session_id=session_id,
-            audit_service=audit_service,
-        )
-        result = await graph.ainvoke(
-            {
-                "messages": [HumanMessage(content=query.query)],
-                "next": "",
-                "context": {},
-            }
-        )
+        result = await get_graph().ainvoke({
+            "messages": [HumanMessage(content=query.query)],
+            "next": "",
+            "context": {},
+        })
         response_content = _extract_response(result)
 
         if audit_service:

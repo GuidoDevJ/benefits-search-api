@@ -6,7 +6,6 @@ extraídos del procesamiento NLP. Incluye caché diario con Redis (24hs).
 """
 
 # Standard library imports
-import asyncio
 from typing import Any, Dict, List, Optional
 
 # Third-party imports
@@ -255,23 +254,29 @@ async def fetch_benefits(
         )
 
 
-async def search_benefits_async(
+@tool
+async def search_benefits(
     query: str,
     categoria: Optional[str] = None,
     dia: Optional[str] = None,
     negocio: Optional[str] = None,
 ) -> dict:
     """
-    Busca beneficios usando entidades pre-extraídas por el LLM classifier.
+    Busca beneficios y descuentos TeVaBien con tarjeta Comafi.
 
     Args:
-        query    : Consulta original del usuario (para logging).
-        categoria: Categoría TeVaBien (ej: "gastronomia", "supermercados").
-        dia      : Día de la semana en español (ej: "lunes").
-        negocio  : Nombre de comercio específico (ej: "carrefour").
+        query    : Consulta del usuario en lenguaje natural.
+        categoria: Categoría del comercio. Opciones: belleza, vehiculos,
+                   supermercados, librerias, combustible, moda, turismo,
+                   vinotecas, hogar/deco, promos del mes, e-commerce,
+                   gastronomia, salud, transporte, jugueterias,
+                   entretenimiento.
+        dia      : Día de la semana (lunes, martes, miercoles, jueves,
+                   viernes, sabado, domingo).
+        negocio  : Nombre de un comercio específico (ej: carrefour, ypf).
 
     Returns:
-        dict con clave "data" (lista de beneficios normalizados).
+        dict con lista de beneficios: comercio, descuento, medio de pago.
     """
     entities = Entities(
         categoria=categoria,
@@ -297,41 +302,14 @@ async def search_benefits_async(
     return result
 
 
-@tool
-def search_benefits(
-    query: str,
-    categoria: Optional[str] = None,
-    dia: Optional[str] = None,
-    negocio: Optional[str] = None,
-) -> dict:
-    """
-    Busca beneficios y descuentos TeVaBien con tarjeta Comafi.
-
-    Args:
-        query    : Consulta del usuario en lenguaje natural.
-        categoria: Categoría del comercio. Opciones: belleza, vehiculos,
-                   supermercados, librerias, combustible, moda, turismo,
-                   vinotecas, hogar/deco, promos del mes, e-commerce,
-                   gastronomia, salud, transporte, jugueterias,
-                   entretenimiento.
-        dia      : Día de la semana (lunes, martes, miercoles, jueves,
-                   viernes, sabado, domingo).
-        negocio  : Nombre de un comercio específico (ej: carrefour, ypf).
-
-    Returns:
-        dict con lista de beneficios: comercio, descuento, medio de pago.
-    """
-    return asyncio.run(
-        search_benefits_async(query, categoria, dia, negocio)
-    )
-
-
 # Demo
 if __name__ == "__main__":
+    import asyncio
+
     async def main():
         query = "promociones en moda"
         print(f"Query: {query}\n")
-        result = await search_benefits_async(query)
-        print(f"Beneficios encontrados: {len(result.get('success', []))}")
+        result = await search_benefits.ainvoke({"query": query})
+        print(f"Beneficios encontrados: {len(result.get('data', []))}")
 
     asyncio.run(main())

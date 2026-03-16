@@ -33,6 +33,10 @@ CW_LOG_GROUP_UNHANDLED = os.getenv(
 )
 CW_RETENTION_DAYS = int(os.getenv("CW_RETENTION_DAYS", "90"))
 
+# Bedrock Guardrails (EST-PAI-055)
+BEDROCK_GUARDRAIL_ID = os.getenv("BEDROCK_GUARDRAIL_ID", "")
+BEDROCK_GUARDRAIL_VERSION = os.getenv("BEDROCK_GUARDRAIL_VERSION", "DRAFT")
+
 # Validaciones
 # En ECS con task role, boto3 obtiene credenciales vía metadata endpoint;
 # no se necesitan claves estáticas.

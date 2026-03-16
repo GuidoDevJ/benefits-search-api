@@ -56,3 +56,10 @@ test_*.py
 *.bak
 *.tmp
 nul
+
+# Documentación / archivos de negocio (no van a la imagen)
+*.pdf
+*.pptx
+*.ppt
+*.docx
+*.xlsx

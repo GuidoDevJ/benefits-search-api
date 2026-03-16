@@ -1,0 +1,7 @@
+# Normalizar line endings en checkout
+* text=auto
+
+# Scripts de shell siempre LF — nunca CRLF (rompe #!/bin/sh en Linux)
+*.sh text eol=lf
+docker-entrypoint.sh text eol=lf
+Dockerfile text eol=lf

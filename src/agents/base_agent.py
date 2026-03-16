@@ -1,18 +1,16 @@
-from typing import Any, TypedDict, Annotated, Optional
-from langchain_aws import ChatBedrock
-from langchain_core.messages import (
-    BaseMessage,
-    SystemMessage,
-    ToolMessage,
-    AIMessage
-)
 import operator
+from typing import Any, Annotated, Optional
 
-from src.serialization import get_serializer
+from langchain_core.messages import BaseMessage
+
+try:
+    from typing import TypedDict
+except ImportError:
+    from typing_extensions import TypedDict
 
 
 class AgentState(TypedDict):
-    """Estado compartido entre todos los agentes"""
+    """Estado compartido entre todos los agentes."""
     messages: Annotated[list[BaseMessage], operator.add]
     next: str
     context: dict
@@ -20,64 +18,21 @@ class AgentState(TypedDict):
     audit_service: Optional[Any]
 
 
-def create_agent(llm: ChatBedrock, tools: list, system_prompt: str):
-    """
-    Factory para crear agentes con herramientas.
-
-    Solución óptima: Solo guardar en el estado el resultado final,
-    no los mensajes intermedios de tool execution.
-    """
-
-    # Crear un mapeo de herramientas por nombre
-    tool_map = {tool.name: tool for tool in tools} if tools else {}
-
-    def agent_node(state: AgentState):
-        messages = state["messages"]
-        serializer = get_serializer()
-
-        # Crear lista temporal con system prompt
-        # No se inyecta format_hint aquí — solo en agentes que procesan
-        # datos serializados (ej: benefits_agent)
-        temp_messages = []
-        if system_prompt:
-            temp_messages.append(SystemMessage(content=system_prompt))
-        temp_messages.extend(messages)
-
-        # Invocar el modelo
-        if tools:
-            llm_with_tools = llm.bind_tools(tools)
-            response = llm_with_tools.invoke(temp_messages)
-        else:
-            response = llm.invoke(temp_messages)
-
-        # Si hay tool calls, ejecutarlos en un loop
-        # hasta que el modelo no genere más tool calls
-        while hasattr(response, 'tool_calls') and response.tool_calls:
-            tool_messages = []
-
-            for tool_call in response.tool_calls:
-                tool_name = tool_call['name']
-                tool_args = tool_call['args']
-
-                # Ejecutar la herramienta
-                if tool_name in tool_map:
-                    tool_result = tool_map[tool_name].invoke(tool_args)
-                    tool_content = serializer.serialize(tool_result)
-                    tool_messages.append(
-                        ToolMessage(
-                            content=tool_content,
-                            tool_call_id=tool_call['id']
-                        )
-                    )
-
-            # Agregar el response y tool messages al contexto temporal
-            temp_messages = temp_messages + [response] + tool_messages
-
-            # Invocar nuevamente para obtener la siguiente respuesta
-            response = llm_with_tools.invoke(temp_messages)
-
-        # Retornar solo el mensaje final (sin tool_calls)
-        # Esto mantiene el estado limpio
-        return {"messages": [response]}
-
-    return agent_node
+def messages_to_dict(messages: list[BaseMessage]) -> list[dict]:
+    """Convierte mensajes LangChain a dicts serializables para auditoría."""
+    result = []
+    for msg in messages:
+        role = msg.__class__.__name__.replace("Message", "").lower()
+        content = (
+            msg.content if isinstance(msg.content, str) else str(msg.content)
+        )
+        entry: dict = {"role": role, "content": content[:2000]}
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            entry["tool_calls"] = [
+                {"name": tc["name"], "args": tc["args"]}
+                for tc in msg.tool_calls
+            ]
+        if hasattr(msg, "tool_call_id"):
+            entry["tool_call_id"] = msg.tool_call_id
+        result.append(entry)
+    return result
