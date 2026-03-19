@@ -53,6 +53,7 @@ def create_benefits_agent(llm: ChatBedrock):
         audit_service = state.get("audit_service")
         messages: list[BaseMessage] = state["messages"]
         context = state.get("context", {})
+        user_profile: dict = state.get("user_profile") or {}
 
         classification = context.get("classification", {})
         categoria = classification.get("categoria_benefits")
@@ -60,6 +61,27 @@ def create_benefits_agent(llm: ChatBedrock):
         negocio = classification.get("negocio")
 
         system_content = _base_system
+
+        # ── Personalización con perfil del usuario ─────────────────────────
+        if user_profile.get("identificado"):
+            profile_lines = []
+            nombre = user_profile.get("nombre_completo") or user_profile.get("nombre")
+            if nombre:
+                profile_lines.append(f"- Nombre: {nombre}")
+            if user_profile.get("segmento"):
+                profile_lines.append(f"- Segmento: {user_profile['segmento']}")
+            if user_profile.get("productos"):
+                productos_str = ", ".join(user_profile["productos"])
+                profile_lines.append(f"- Productos: {productos_str}")
+            if profile_lines:
+                ctx_block = (
+                    "Datos del cliente identificado:\n"
+                    + "\n".join(profile_lines)
+                    + "\n\nUsá el nombre para personalizar el saludo "
+                    "y considerá el segmento al priorizar beneficios."
+                )
+                system_content = f"{ctx_block}\n\n{system_content}"
+
         if any([categoria, dia, negocio]):
             hints = ", ".join(
                 f"{k}={v}"

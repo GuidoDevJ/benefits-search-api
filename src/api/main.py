@@ -2,14 +2,16 @@
 FastAPI — API REST + Gradio UI para el sistema de búsqueda de beneficios.
 
 Rutas:
-  GET  /           → health check
-  POST /benefits   → API REST (JSON)
-  GET  /audit/session/{id} → detalle de sesión auditada
-  GET  /chat       → interfaz Gradio (montada como sub-app)
+  GET  /                       → health check
+  POST /benefits               → API REST (JSON)
+  DELETE /benefits/memory      → limpia historial de un usuario
+  GET  /audit/session/{id}     → detalle de sesión auditada
+  GET  /chat                   → interfaz Gradio (montada como sub-app)
 """
 
 import time
 from contextlib import asynccontextmanager
+from typing import Optional
 from uuid import uuid4
 
 import gradio as gr
@@ -19,7 +21,12 @@ from fastapi.responses import JSONResponse
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel
 
-from ..config import AUDIT_ENABLED, BEDROCK_MODEL_ID
+from ..config import (
+    AUDIT_ENABLED,
+    BEDROCK_MODEL_ID,
+    MEMORY_ENABLED,
+    USER_IDENTIFICATION_ENABLED,
+)
 from ..graph import get_graph
 from ..ui.audit_interface import create_audit_interface
 from ..ui.chat_interface import create_chat_interface
@@ -27,6 +34,11 @@ from ..ui.chat_interface import create_chat_interface
 
 class QueryRequest(BaseModel):
     query: str
+    phone_number: Optional[str] = None   # Número WhatsApp del usuario
+
+
+class ClearMemoryRequest(BaseModel):
+    phone_number: str
 
 
 @asynccontextmanager
@@ -42,9 +54,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# ── Gradio montado en /chat y /audit-ui ─────────────────────────────────────
-# Ambas interfaces corren en el mismo proceso uvicorn en el puerto 8000.
-# WebSockets de Gradio requieren WORKERS=1 o sticky sessions en el ALB.
+# ── Gradio montado en /chat y /audit-ui ──────────────────────────────────────
 app = gr.mount_gradio_app(app, create_chat_interface(), path="/chat")
 app = gr.mount_gradio_app(app, create_audit_interface(), path="/audit-ui")
 
@@ -91,12 +101,6 @@ def _extract_response(result: dict) -> str:
 async def get_audit_session(session_id: str):
     """
     Devuelve el resumen y todos los registros de auditoría de una sesión.
-
-    Response:
-        {
-            "session": { ...SessionSummary... },
-            "records": [ ...AuditRecord... ]
-        }
     """
     if not AUDIT_ENABLED:
         raise HTTPException(
@@ -132,11 +136,29 @@ async def get_audit_session(session_id: str):
     })
 
 
+@app.delete("/benefits/memory")
+async def clear_user_memory(req: ClearMemoryRequest):
+    """Limpia el historial de conversación de un usuario."""
+    if not MEMORY_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="Memoria deshabilitada (MEMORY_ENABLED=false)",
+        )
+    from ..memory import get_memory_service
+    memory = await get_memory_service()
+    await memory.clear(req.phone_number)
+    return JSONResponse(content={
+        "ok": True,
+        "message": f"Historial limpiado para {req.phone_number[-4:]}",
+    })
+
+
 @app.post("/benefits")
 async def get_benefits(query: QueryRequest):
     session_id = str(uuid4())
     t_start = time.monotonic()
     audit_service = None
+    phone = query.phone_number
 
     if AUDIT_ENABLED:
         from ..audit.audit_service import get_audit_service
@@ -147,14 +169,66 @@ async def get_benefits(query: QueryRequest):
             query=query.query,
         )
 
-    print(f"[API] session={session_id[:8]} query={query.query!r}")
+    # ── 1. Cargar historial de conversación desde Redis ──────────────────
+    history = []
+    if phone and MEMORY_ENABLED:
+        try:
+            from ..memory import get_memory_service
+            memory_svc = await get_memory_service()
+            history = await memory_svc.load_history(phone)
+        except Exception as e:
+            print(f"[API] Error cargando memoria: {e}")
+
+    # ── 2. Identificar usuario via sofia-api-users ───────────────────────
+    user_profile_dict: Optional[dict] = None
+    if phone and USER_IDENTIFICATION_ENABLED:
+        try:
+            from ..tools.user_profile import fetch_user_profile
+            profile = await fetch_user_profile(phone)
+            user_profile_dict = profile.model_dump()
+            status = (
+                "identificado" if profile.identificado
+                else "no identificado"
+            )
+            print(
+                f"[API] session={session_id[:8]} "
+                f"usuario={status} ({phone[-4:]})"
+            )
+        except Exception as e:
+            print(f"[API] Error identificando usuario: {e}")
+
+    print(
+        f"[API] session={session_id[:8]} "
+        f"query={query.query!r} "
+        f"historial={len(history)} msgs"
+    )
+
     try:
+        messages = history + [HumanMessage(content=query.query)]
+
         result = await get_graph().ainvoke({
-            "messages": [HumanMessage(content=query.query)],
+            "messages": messages,
             "next": "",
             "context": {},
+            "session_id": session_id,
+            "audit_service": audit_service,
+            "phone_number": phone,
+            "user_profile": user_profile_dict,
         })
         response_content = _extract_response(result)
+
+        # ── 3. Guardar nueva interacción en memoria ──────────────────────
+        if phone and MEMORY_ENABLED:
+            try:
+                from ..memory import get_memory_service
+                memory_svc = await get_memory_service()
+                new_ai_msg = result["messages"][-1]
+                await memory_svc.save_messages(
+                    phone,
+                    [HumanMessage(content=query.query), new_ai_msg],
+                )
+            except Exception as e:
+                print(f"[API] Error guardando memoria: {e}")
 
         if audit_service:
             total_ms = int((time.monotonic() - t_start) * 1000)

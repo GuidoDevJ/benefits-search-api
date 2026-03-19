@@ -16,6 +16,18 @@ BEDROCK_MODEL_ID = os.getenv(
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
+# Sofia API Users (identificación de usuario por WhatsApp)
+SOFIA_API_URL = os.getenv("SOFIA_API_URL", "http://localhost:3000")
+SOFIA_API_TOKEN = os.getenv("SOFIA_API_TOKEN", "")
+USER_IDENTIFICATION_ENABLED = (
+    os.getenv("USER_IDENTIFICATION_ENABLED", "true").lower() == "true"
+)
+
+# Memoria conversacional (Redis)
+MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "true").lower() == "true"
+MEMORY_MAX_MESSAGES = int(os.getenv("MEMORY_MAX_MESSAGES", "20"))
+MEMORY_TTL_SECONDS = int(os.getenv("MEMORY_TTL_SECONDS", str(24 * 3600)))
+
 # Cache
 CACHE_ENABLED = os.getenv("CACHE_ENABLED", "true").lower() == "true"
 
@@ -26,8 +38,12 @@ SERIALIZATION_FORMAT = os.getenv("SERIALIZATION_FORMAT", "toon")
 AUDIT_ENABLED = os.getenv("AUDIT_ENABLED", "true").lower() == "true"
 
 # CloudWatch Logs — log groups y retention (audit + unhandled queries)
-CW_LOG_GROUP_RECORDS = os.getenv("CW_LOG_GROUP_RECORDS", "/comafi/audit/records")
-CW_LOG_GROUP_SESSIONS = os.getenv("CW_LOG_GROUP_SESSIONS", "/comafi/audit/sessions")
+CW_LOG_GROUP_RECORDS = os.getenv(
+    "CW_LOG_GROUP_RECORDS", "/comafi/audit/records"
+)
+CW_LOG_GROUP_SESSIONS = os.getenv(
+    "CW_LOG_GROUP_SESSIONS", "/comafi/audit/sessions"
+)
 CW_LOG_GROUP_UNHANDLED = os.getenv(
     "CW_LOG_GROUP_UNHANDLED", "/comafi/unhandled-queries"
 )
@@ -45,8 +61,8 @@ _ecs_task_role = os.getenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") or \
 
 if not _ecs_task_role and (not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY):
     raise ValueError(
-        "AWS_ACCESS_KEY_ID y AWS_SECRET_ACCESS_KEY deben estar configuradas en .env "
-        "(o ejecutar en ECS con un IAM task role asignado)"
+        "AWS_ACCESS_KEY_ID y AWS_SECRET_ACCESS_KEY deben estar "
+        "configuradas en .env (o ejecutar en ECS con IAM task role)"
     )
 
 if not os.getenv("LANGCHAIN_API_KEY"):

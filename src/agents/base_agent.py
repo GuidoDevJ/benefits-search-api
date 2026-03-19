@@ -16,6 +16,9 @@ class AgentState(TypedDict):
     context: dict
     session_id: Optional[str]
     audit_service: Optional[Any]
+    # Identificación de usuario
+    phone_number: Optional[str]   # Número de WhatsApp del usuario
+    user_profile: Optional[dict]  # Perfil obtenido de sofia-api-users
 
 
 def messages_to_dict(messages: list[BaseMessage]) -> list[dict]:
