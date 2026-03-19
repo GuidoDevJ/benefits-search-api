@@ -1,12 +1,9 @@
 """
 Multi-agent graph — Grafo LangGraph con supervisor + benefits.
 
-Acepta `session_id` y `audit_service` opcionales para que cada
-invocación quede completamente auditada sin cambiar la interfaz
-pública cuando el audit está deshabilitado.
+Singleton: el grafo se compila una sola vez al inicio del proceso.
+session_id y audit_service viajan en el estado por request.
 """
-
-from typing import TYPE_CHECKING, Optional
 
 from langchain_aws import ChatBedrock
 from langgraph.graph import END, StateGraph
@@ -14,62 +11,57 @@ from langgraph.graph import END, StateGraph
 from .agents.base_agent import AgentState
 from .agents.benefits_agent import create_benefits_agent
 from .agents.supervisor_agent import create_supervisor_agent
-from .config import AWS_REGION, BEDROCK_MODEL_ID
+from .config import (
+    AWS_REGION,
+    BEDROCK_GUARDRAIL_ID,
+    BEDROCK_GUARDRAIL_VERSION,
+    BEDROCK_MODEL_ID,
+)
 
-if TYPE_CHECKING:
-    from .audit.audit_service import AuditService
+_guardrails = (
+    {
+        "guardrailIdentifier": BEDROCK_GUARDRAIL_ID,
+        "guardrailVersion": BEDROCK_GUARDRAIL_VERSION,
+    }
+    if BEDROCK_GUARDRAIL_ID
+    else None
+)
+_llm = ChatBedrock(
+    model_id=BEDROCK_MODEL_ID,
+    region_name=AWS_REGION,
+    **({"guardrails": _guardrails} if _guardrails else {}),
+)
+_graph = None
 
 
-def create_multiagent_graph(
-    session_id: Optional[str] = None,
-    audit_service: Optional["AuditService"] = None,
-):
-    """
-    Construye y compila el grafo multiagente.
+def get_graph():
+    """Retorna el grafo compilado (singleton)."""
+    global _graph
+    if _graph is None:
+        _graph = _build_graph()
+    return _graph
 
-    Args:
-        session_id    : ID de sesión para auditoría. Si None, no audita.
-        audit_service : Instancia de AuditService. Si None, no audita.
 
-    Returns:
-        Grafo compilado listo para ainvoke().
-    """
-    llm = ChatBedrock(
-        model_id=BEDROCK_MODEL_ID,
-        region_name=AWS_REGION,
-    )
-
-    agents = ["benefits"]
-
-    benefits = create_benefits_agent(
-        llm,
-        session_id=session_id,
-        audit_service=audit_service,
-    )
-    supervisor = create_supervisor_agent(
-        llm,
-        agents,
-        session_id=session_id,
-        audit_service=audit_service,
-    )
+def _build_graph():
+    benefits = create_benefits_agent(_llm)
+    supervisor = create_supervisor_agent(_llm, ["benefits"])
 
     workflow = StateGraph(AgentState)
     workflow.add_node("supervisor", supervisor)
     workflow.add_node("benefits", benefits)
-
-    for agent in agents:
-        workflow.add_edge(agent, "supervisor")
+    workflow.add_edge("benefits", "supervisor")
 
     def should_continue(state):
-        next_agent = state.get("next", "finish")
-        return "finish" if next_agent == "finish" else next_agent
-
-    conditional_map = {agent: agent for agent in agents}
-    conditional_map["finish"] = END
+        return (
+            "finish"
+            if state.get("next", "finish") == "finish"
+            else state["next"]
+        )
 
     workflow.add_conditional_edges(
-        "supervisor", should_continue, conditional_map
+        "supervisor",
+        should_continue,
+        {"benefits": "benefits", "finish": END},
     )
     workflow.set_entry_point("supervisor")
-
     return workflow.compile()

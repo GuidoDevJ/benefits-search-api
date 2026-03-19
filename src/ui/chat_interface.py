@@ -1,12 +1,12 @@
 """
 Interfaz de chat async con Gradio para el sistema de búsqueda de beneficios.
 
-Cambios respecto a la versión original:
-  - Genera un session_id (UUID) por consulta para trazabilidad completa.
-  - Registra input, NLP result, respuesta y errores en AuditService.
-  - El session_id se muestra en el acordeón de trazabilidad para que
-    el usuario lo copie y lo use en el Audit Dashboard (replay).
-  - Si AUDIT_ENABLED=false, funciona idéntico a la versión original.
+- Genera un session_id (UUID) por consulta para trazabilidad completa.
+- Registra input, NLP result, respuesta y errores en AuditService.
+- El session_id se muestra en el acordeón de trazabilidad para que
+  el usuario lo copie y lo use en el Audit Dashboard (replay).
+- Clasificación determinística (fast_classify) con fallback a LLM.
+- Si AUDIT_ENABLED=false, funciona idéntico a la versión original.
 """
 
 import time
@@ -17,8 +17,10 @@ import gradio as gr
 from langchain_core.messages import HumanMessage
 
 from ..config import AUDIT_ENABLED, BEDROCK_MODEL_ID
-from ..graph import create_multiagent_graph
-from ..tools.nlp_processor import nlp_pipeline
+from ..graph import get_graph
+from ..tools.nlp_processor import is_valid_query
+from ..tools.llm_classifier import classify_query
+from ..tools.fast_classifier import fast_classify
 from ..tools.push_notifications import send_push_notification
 from ..tools.cloudwatch_unhandled_queries import get_cw_service
 
@@ -61,24 +63,52 @@ async def chat_function(
         audit_service = await get_audit_service()
 
     try:
-        nlp_result = nlp_pipeline(message)
-        nlp_dict = nlp_result.model_dump()
+        # ── 1. Validación rápida con spaCy (solo detecta gibberish) ────
+        if not is_valid_query(message):
+            resp = (
+                "No pude entender tu consulta. "
+                "Podés preguntarme sobre:\n"
+                "• Descuentos y beneficios: gastronomía, supermercados, "
+                "entretenimiento, etc."
+            )
+            if audit_service:
+                await audit_service.record_user_input(
+                    session_id=session_id,
+                    model_id=BEDROCK_MODEL_ID,
+                    query=message,
+                    nlp_result={"intent": "invalid", "entities": {}},
+                )
+                total_ms = int((time.monotonic() - t_start) * 1000)
+                await audit_service.record_final_response(
+                    session_id=session_id,
+                    model_id=BEDROCK_MODEL_ID,
+                    response=resp,
+                    total_latency_ms=total_ms,
+                )
+            return resp, session_id
+
+        # ── 2. Clasificación: determinístico con fallback a LLM ────────
+        classification = fast_classify(message)
+        if classification is None:
+            classification = await classify_query(message)
+        classification_dict = classification.model_dump()
 
         if audit_service:
             await audit_service.record_user_input(
                 session_id=session_id,
                 model_id=BEDROCK_MODEL_ID,
                 query=message,
-                nlp_result=nlp_dict,
+                nlp_result=classification_dict,
             )
 
-        if nlp_result.intent == "unknown":
+        # ── 3. Rechazar intents desconocidos (con logging) ─────────────
+        if classification.intent == "unknown":
             try:
                 s3_service = await get_cw_service()
                 await s3_service.save_unhandled_query(
                     query=message,
-                    detected_intent=nlp_result.intent,
-                    entities=nlp_result.entities.model_dump(),
+                    detected_intent="unknown",
+                    entities={},
                     reason="unknown_intent",
                 )
             except Exception as s3_err:
@@ -92,12 +122,11 @@ async def chat_function(
                 print(f"[Push] Error: {push_err}")
 
             resp = (
-                "No pude identificar tu consulta. "
-                "Intenta preguntarme sobre promociones, descuentos o "
-                "beneficios en categorías como gastronomía, supermercados, "
+                "No puedo ayudarte con eso. "
+                "Podés preguntarme sobre:\n"
+                "• Descuentos y beneficios: gastronomía, supermercados, "
                 "entretenimiento, etc."
             )
-
             if audit_service:
                 total_ms = int((time.monotonic() - t_start) * 1000)
                 await audit_service.record_final_response(
@@ -106,18 +135,16 @@ async def chat_function(
                     response=resp,
                     total_latency_ms=total_ms,
                 )
-
             return resp, session_id
 
-        graph = create_multiagent_graph(
-            session_id=session_id,
-            audit_service=audit_service,
-        )
-        result = await graph.ainvoke(
+        # ── 4. Invocar grafo con entidades pre-clasificadas ────────────
+        result = await get_graph().ainvoke(
             {
                 "messages": [HumanMessage(content=message)],
                 "next": "",
-                "context": {"nlp_result": nlp_dict},
+                "context": {"classification": classification_dict},
+                "session_id": session_id,
+                "audit_service": audit_service,
             }
         )
         response_content = _extract_response(result)
@@ -156,13 +183,13 @@ def create_chat_interface() -> gr.Blocks:
     examples = [
         "promociones en supermercados",
         "descuentos en restaurantes",
-        "beneficios en gastronomía",
         "ofertas en entretenimiento",
-        "promociones para viajar",
+        "beneficios los lunes",
+        "descuentos en YPF",
     ]
 
     with gr.Blocks(title="Asistente de Beneficios TeVaBien") as demo:
-        gr.Markdown("# 🎁 Asistente de Beneficios TeVaBien")
+        gr.Markdown("# Asistente de Beneficios TeVaBien")
         gr.Markdown(
             "¡Bienvenido! Pregúntame sobre promociones, descuentos y beneficios. "
             "Puedo ayudarte a encontrar ofertas en gastronomía, entretenimiento, "
@@ -182,7 +209,7 @@ def create_chat_interface() -> gr.Blocks:
 
         gr.Examples(examples=examples, inputs=msg_input)
 
-        with gr.Accordion("🔍 Trazabilidad de sesión", open=False):
+        with gr.Accordion("Trazabilidad de sesión", open=False):
             gr.Markdown(
                 "Copia el **Session ID** para hacer replay en el "
                 "Audit Dashboard (`python -m src.audit_app`)."

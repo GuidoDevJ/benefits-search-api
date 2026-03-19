@@ -20,7 +20,7 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 CACHE_ENABLED = os.getenv("CACHE_ENABLED", "true").lower() == "true"
 
 # Serialization Format for LLM communication ("json" or "toon")
-SERIALIZATION_FORMAT = os.getenv("SERIALIZATION_FORMAT", "json")
+SERIALIZATION_FORMAT = os.getenv("SERIALIZATION_FORMAT", "toon")
 
 # Audit Configuration
 AUDIT_ENABLED = os.getenv("AUDIT_ENABLED", "true").lower() == "true"
@@ -32,6 +32,10 @@ CW_LOG_GROUP_UNHANDLED = os.getenv(
     "CW_LOG_GROUP_UNHANDLED", "/comafi/unhandled-queries"
 )
 CW_RETENTION_DAYS = int(os.getenv("CW_RETENTION_DAYS", "90"))
+
+# Bedrock Guardrails (EST-PAI-055)
+BEDROCK_GUARDRAIL_ID = os.getenv("BEDROCK_GUARDRAIL_ID", "")
+BEDROCK_GUARDRAIL_VERSION = os.getenv("BEDROCK_GUARDRAIL_VERSION", "DRAFT")
 
 # Validaciones
 # En ECS con task role, boto3 obtiene credenciales vía metadata endpoint;
