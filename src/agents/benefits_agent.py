@@ -10,7 +10,9 @@ import time
 from typing import Optional
 
 from langchain_aws import ChatBedrock
-from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage, BaseMessage, HumanMessage, SystemMessage
+)
 
 from src.audit.models import TokenUsage
 from src.audit.prompt_registry import get_prompt_registry
@@ -127,16 +129,19 @@ def create_benefits_agent(llm: ChatBedrock):
             )
 
         # ── Formateo: resultados inyectados en system prompt ───────────
+        # Se usa HumanMessage neutro en lugar del mensaje original del usuario
+        # para evitar que el guardrail de Bedrock bloquee palabras del input
+        # (ej: "restaurante"). El LLM solo necesita los resultados.
         tool_content = serializer.serialize(tool_result)
         format_messages: list[BaseMessage] = [
             SystemMessage(
                 content=(
                     f"{system_content}\n\n"
-                    f"RESULTADOS DE BÚSQUEDA:\n{tool_content}\n\n"
-                    f"Formateá estos resultados para el usuario."
+                    f"RESULTADOS DE BÚSQUEDA:\n{tool_content}"
                 )
             ),
-        ] + filtered_messages
+            HumanMessage(content="Presentá los resultados al usuario."),
+        ]
 
         t0 = time.monotonic()
         response = await llm.ainvoke(format_messages)

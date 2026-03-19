@@ -53,8 +53,8 @@ Devolvé ÚNICAMENTE un JSON con este formato exacto (sin texto adicional):
 }}
 
 INTENT:
-- "benefits": el usuario pregunta por descuentos, promos, beneficios, \
-cuotas sin interés, reintegros
+- "benefits": el usuario pregunta por descuentos, promos, beneficios,
+  cuotas sin interés, reintegros
 - "tienda"  : el usuario quiere COMPRAR algo (producto, precio, modelo)
 - "unknown" : saludos, preguntas sin sentido, temas irrelevantes al banco
 
@@ -78,6 +78,11 @@ Tolerá errores de tipeo y jerga argentina:
 "kiero"→quiero, "cuota"→cuotas, "mc"→mcdonalds, "supermer"→supermercados,
 "celu"→celular→Tecnología, "tele"→televisor→Tecnología,
 "ropa"→Moda, "zapatillas"→Moda, "heladera"→Electrodomésticos
+
+Inputs con emojis o formato estructurado (ej: "6c | 💳 | 📅 todos los días"):
+Interpretá "Xc" o "X cuotas" como cuotas sin interés → intent=benefits.
+💳 indica medio de pago con tarjeta, 📅 indica días de validez.
+Estos inputs son consultas sobre beneficios aunque no tengan forma de pregunta.
 
 Respondé SOLO el JSON, sin explicaciones ni markdown."""
 

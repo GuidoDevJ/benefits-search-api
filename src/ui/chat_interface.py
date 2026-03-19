@@ -18,11 +18,7 @@ from langchain_core.messages import HumanMessage
 
 from ..config import AUDIT_ENABLED, BEDROCK_MODEL_ID
 from ..graph import get_graph
-from ..tools.nlp_processor import is_valid_query
-from ..tools.llm_classifier import classify_query
-from ..tools.fast_classifier import fast_classify
-from ..tools.push_notifications import send_push_notification
-from ..tools.cloudwatch_unhandled_queries import get_cw_service
+from ..tools.query_pipeline import classify_and_validate
 
 
 def _extract_response(result: dict) -> str:
@@ -63,81 +59,29 @@ async def chat_function(
         audit_service = await get_audit_service()
 
     try:
-        # ── 1. Validación rápida con spaCy (solo detecta gibberish) ────
-        if not is_valid_query(message):
-            resp = (
-                "No pude entender tu consulta. "
-                "Podés preguntarme sobre:\n"
-                "• Descuentos y beneficios: gastronomía, supermercados, "
-                "entretenimiento, etc."
-            )
-            if audit_service:
-                await audit_service.record_user_input(
-                    session_id=session_id,
-                    model_id=BEDROCK_MODEL_ID,
-                    query=message,
-                    nlp_result={"intent": "invalid", "entities": {}},
-                )
-                total_ms = int((time.monotonic() - t_start) * 1000)
-                await audit_service.record_final_response(
-                    session_id=session_id,
-                    model_id=BEDROCK_MODEL_ID,
-                    response=resp,
-                    total_latency_ms=total_ms,
-                )
-            return resp, session_id
-
-        # ── 2. Clasificación: determinístico con fallback a LLM ────────
-        classification = fast_classify(message)
-        if classification is None:
-            classification = await classify_query(message)
-        classification_dict = classification.model_dump()
+        # ── 1. Validación y clasificación (pipeline compartido) ─────────
+        classification_dict, rejection = await classify_and_validate(message)
 
         if audit_service:
             await audit_service.record_user_input(
                 session_id=session_id,
                 model_id=BEDROCK_MODEL_ID,
                 query=message,
-                nlp_result=classification_dict,
+                nlp_result=classification_dict or {"intent": "unknown"},
             )
 
-        # ── 3. Rechazar intents desconocidos (con logging) ─────────────
-        if classification.intent == "unknown":
-            try:
-                s3_service = await get_cw_service()
-                await s3_service.save_unhandled_query(
-                    query=message,
-                    detected_intent="unknown",
-                    entities={},
-                    reason="unknown_intent",
-                )
-            except Exception as s3_err:
-                print(f"[CW] Error guardando query: {s3_err}")
-
-            try:
-                await send_push_notification(
-                    f"Query no identificada: {message}"
-                )
-            except Exception as push_err:
-                print(f"[Push] Error: {push_err}")
-
-            resp = (
-                "No puedo ayudarte con eso. "
-                "Podés preguntarme sobre:\n"
-                "• Descuentos y beneficios: gastronomía, supermercados, "
-                "entretenimiento, etc."
-            )
+        if rejection:
             if audit_service:
                 total_ms = int((time.monotonic() - t_start) * 1000)
                 await audit_service.record_final_response(
                     session_id=session_id,
                     model_id=BEDROCK_MODEL_ID,
-                    response=resp,
+                    response=rejection,
                     total_latency_ms=total_ms,
                 )
-            return resp, session_id
+            return rejection, session_id
 
-        # ── 4. Invocar grafo con entidades pre-clasificadas ────────────
+        # ── 2. Invocar grafo con entidades pre-clasificadas ────────────
         result = await get_graph().ainvoke(
             {
                 "messages": [HumanMessage(content=message)],

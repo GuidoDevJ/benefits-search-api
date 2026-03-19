@@ -155,6 +155,13 @@ _KNOWN_NEGOCIOS: dict[str, str] = {
     "walmart": "walmart",
 }
 
+# Patrones precompilados con word boundary para evitar falsos positivos
+# (ej: "dia" no debe matchear "dias", "bk" no debe matchear "bkp", etc.)
+_NEGOCIO_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\b" + re.escape(k) + r"\b"), v)
+    for k, v in _KNOWN_NEGOCIOS.items()
+]
+
 # ---------------------------------------------------------------------------
 # Clasificador principal
 # ---------------------------------------------------------------------------
@@ -179,8 +186,8 @@ def fast_classify(query: str) -> Optional[Classification]:
 
     # ── Negocio ──────────────────────────────────────────────────────────
     negocio: Optional[str] = None
-    for keyword, nombre in _KNOWN_NEGOCIOS.items():
-        if keyword in text:
+    for pattern, nombre in _NEGOCIO_PATTERNS:
+        if pattern.search(text):
             negocio = nombre
             break
 

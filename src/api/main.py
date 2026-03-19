@@ -21,6 +21,7 @@ from pydantic import BaseModel
 
 from ..config import AUDIT_ENABLED, BEDROCK_MODEL_ID
 from ..graph import get_graph
+from ..tools.query_pipeline import classify_and_validate
 from ..ui.audit_interface import create_audit_interface
 from ..ui.chat_interface import create_chat_interface
 
@@ -141,18 +142,43 @@ async def get_benefits(query: QueryRequest):
     if AUDIT_ENABLED:
         from ..audit.audit_service import get_audit_service
         audit_service = await get_audit_service()
-        await audit_service.record_user_input(
-            session_id=session_id,
-            model_id=BEDROCK_MODEL_ID,
-            query=query.query,
-        )
 
     print(f"[API] session={session_id[:8]} query={query.query!r}")
     try:
+        # ── 1. Validación y clasificación (igual que Gradio) ────────────
+        classification_dict, rejection = await classify_and_validate(
+            query.query
+        )
+
+        if audit_service:
+            await audit_service.record_user_input(
+                session_id=session_id,
+                model_id=BEDROCK_MODEL_ID,
+                query=query.query,
+                nlp_result=classification_dict or {"intent": "unknown"},
+            )
+
+        if rejection:
+            if audit_service:
+                total_ms = int((time.monotonic() - t_start) * 1000)
+                await audit_service.record_final_response(
+                    session_id=session_id,
+                    model_id=BEDROCK_MODEL_ID,
+                    response=rejection,
+                    total_latency_ms=total_ms,
+                )
+            return JSONResponse(content={
+                "response": rejection,
+                "session_id": session_id,
+            })
+
+        # ── 2. Invocar grafo con clasificación pre-computada ────────────
         result = await get_graph().ainvoke({
             "messages": [HumanMessage(content=query.query)],
             "next": "",
-            "context": {},
+            "context": {"classification": classification_dict},
+            "session_id": session_id,
+            "audit_service": audit_service,
         })
         response_content = _extract_response(result)
 
