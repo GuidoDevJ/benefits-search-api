@@ -21,4 +21,7 @@ class ToonSerializer:
         return toons.dumps(data)
 
     def get_format_instruction(self) -> str:
-        return "Tool data uses TOON format (CSV-like with headers). Read it as structured data."
+        # Hint deshabilitado: el modelo interpreta el formato sin instrucción
+        # explícita, y la frase "Tool data" activaba el filtro de prompt-injection
+        # del guardrail de Bedrock.
+        return ""

@@ -21,30 +21,34 @@ from pydantic import BaseModel
 
 try:
     from ..cache.redis_client import get_redis_client
+    from .user_profile_mocks import get_mock_profile
 except ImportError:
     from src.cache.redis_client import get_redis_client
+    from src.tools.user_profile_mocks import get_mock_profile
 
 
-# ── Configuración ──────────────────────────────────────────────────────────────
-SOFIA_API_URL = os.getenv("SOFIA_API_URL", "http://localhost:3000")
+# ── Configuración ─────────────────────────────────────────────────────────
+SOFIA_API_URL = os.getenv("SOFIA_API_URL")
 SOFIA_API_TOKEN = os.getenv("SOFIA_API_TOKEN", "")
 USER_PROFILE_CACHE_KEY_PREFIX = "comafi:user_profile:"
-USER_PROFILE_CACHE_TTL = int(os.getenv("USER_PROFILE_CACHE_TTL", "1800"))  # 30 min
+USER_PROFILE_CACHE_TTL = int(os.getenv("USER_PROFILE_CACHE_TTL", "1800"))
 REQUEST_TIMEOUT = int(os.getenv("SOFIA_API_TIMEOUT", "5"))
+MOCK_ENABLED = os.getenv("MOCK_USER_PROFILE", "false").lower() == "true"
 
 
 class UserProfile(BaseModel):
     """Perfil del cliente identificado por WhatsApp."""
+
     phone_number: str
     nombre: Optional[str] = None
     apellido: Optional[str] = None
     nombre_completo: Optional[str] = None
-    segmento: Optional[str] = None           # MASIVO, PREMIUM, PYME, etc.
+    segmento: Optional[str] = None  # MASIVO, PREMIUM, PYME, etc.
     nro_documento: Optional[str] = None
-    tipo_documento: Optional[str] = None     # DNI, CUIL, CUIT
-    productos: list[str] = []                # Tarjetas / productos activos
-    identificado: bool = False               # True si se encontró en el banco
-    error: Optional[str] = None             # Mensaje de error si falla
+    tipo_documento: Optional[str] = None  # DNI, CUIL, CUIT
+    productos: list[str] = []  # Tarjetas / productos activos
+    identificado: bool = False  # True si se encontró en el banco
+    error: Optional[str] = None  # Mensaje de error si falla
 
     @property
     def saludo(self) -> str:
@@ -106,7 +110,9 @@ def _parse_profile(phone_number: str, data: dict) -> UserProfile:
         apellido=apellido,
         nombre_completo=nombre_completo,
         segmento=cliente.get("segmento") or cliente.get("segment"),
-        nro_documento=str(cliente.get("nroDocumento") or cliente.get("nro_documento") or ""),
+        nro_documento=str(
+            cliente.get("nroDocumento") or cliente.get("nro_documento") or ""
+        ),
         tipo_documento=cliente.get("tipoDocumento") or cliente.get("tipo_documento"),
         productos=productos,
         identificado=True,
@@ -130,7 +136,9 @@ async def _fetch_from_sofia(phone_number: str) -> Optional[dict]:
             if response.status_code == 200:
                 return response.json()
             elif response.status_code == 404:
-                print(f"[UserProfile] Usuario no encontrado en sofia: {phone_number[-4:]}")
+                print(
+                    f"[UserProfile] Usuario no encontrado en sofia: {phone_number[-4:]}"
+                )
                 return None
             else:
                 print(
@@ -139,7 +147,9 @@ async def _fetch_from_sofia(phone_number: str) -> Optional[dict]:
                 )
                 return None
     except httpx.TimeoutException:
-        print(f"[UserProfile] Timeout al llamar sofia-api-users para {phone_number[-4:]}")
+        print(
+            f"[UserProfile] Timeout al llamar sofia-api-users para {phone_number[-4:]}"
+        )
         return None
     except httpx.ConnectError:
         print(f"[UserProfile] No se pudo conectar a sofia-api-users ({SOFIA_API_URL})")
@@ -153,19 +163,36 @@ async def fetch_user_profile(phone_number: str) -> UserProfile:
     """
     Obtiene el perfil del usuario por número de WhatsApp.
 
-    Estrategia:
+    Estrategia (producción):
     1. Busca en Redis (TTL 30 min)
     2. Si no hay caché, llama a sofia-api-users
     3. Guarda resultado en Redis
-    4. Siempre retorna un UserProfile (con identificado=False si no se encontró)
+    4. Siempre retorna un UserProfile (identificado=False si no encontrado)
+
+    Estrategia (mock activo — MOCK_USER_PROFILE=true):
+    - Devuelve directamente desde el dict de perfiles de prueba.
+    - Saltea Redis y la llamada HTTP.
 
     Args:
-        phone_number: Número de WhatsApp (ej: "+5491112345678" o "5491112345678")
+        phone_number: Número WhatsApp (ej: "+5491112345678")
 
     Returns:
         UserProfile con los datos del cliente
     """
     normalized = _normalize_phone(phone_number)
+
+    # ── Mock: retorno inmediato sin Redis ni HTTP ─────────────────────
+    if MOCK_ENABLED:
+        mock_data = get_mock_profile(normalized)
+        profile = UserProfile(**mock_data)
+        status = "identificado" if profile.identificado else "no identificado"
+        print(
+            f"[UserProfile][MOCK] {status}: "
+            f"{profile.nombre_completo or normalized[-4:]} "
+            f"({profile.segmento or 'sin segmento'})"
+        )
+        return profile
+
     cache_key = f"{USER_PROFILE_CACHE_KEY_PREFIX}{normalized}"
 
     # ── 1. Intentar desde Redis ────────────────────────────────────────────────

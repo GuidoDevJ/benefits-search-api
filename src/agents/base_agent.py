@@ -19,6 +19,8 @@ class AgentState(TypedDict):
     # Identificación de usuario
     phone_number: Optional[str]   # Número de WhatsApp del usuario
     user_profile: Optional[dict]  # Perfil obtenido de sofia-api-users
+    user_prefs:   Optional[dict]  # Preferencias persistentes (ciudad, etc.)
+    is_new_session: bool          # True si es la primera consulta de esta sesión
 
 
 def messages_to_dict(messages: list[BaseMessage]) -> list[dict]:

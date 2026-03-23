@@ -17,10 +17,14 @@ REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
 # Sofia API Users (identificación de usuario por WhatsApp)
-SOFIA_API_URL = os.getenv("SOFIA_API_URL", "http://localhost:3000")
-SOFIA_API_TOKEN = os.getenv("SOFIA_API_TOKEN", "")
+SOFIA_API_URL = os.getenv("SOFIA_API_URL")
+SOFIA_API_TOKEN = os.getenv("SOFIA_API_TOKEN")
 USER_IDENTIFICATION_ENABLED = (
     os.getenv("USER_IDENTIFICATION_ENABLED", "true").lower() == "true"
+)
+# Mock de perfiles (desarrollo local — saltea sofia-api-users y Redis)
+MOCK_USER_PROFILE = (
+    os.getenv("MOCK_USER_PROFILE", "false").lower() == "true"
 )
 
 # Memoria conversacional (Redis)
