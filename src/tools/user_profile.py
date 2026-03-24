@@ -75,45 +75,97 @@ def _normalize_phone(phone_number: str) -> str:
     return "".join(c for c in phone_number if c.isdigit() or c == "+")
 
 
-def _parse_profile(phone_number: str, data: dict) -> UserProfile:
+def _parse_profile(phone_number: str, raw: dict) -> UserProfile:
     """
     Parsea la respuesta de sofia-api-users al modelo UserProfile.
 
-    La API retorna distintas estructuras según el endpoint:
-    - /users/:userId      → { cliente: { nombre, apellido, segmento, ... } }
-    - /users/.../complements → estructura similar con pos-cons
+    Estructura real de la API (endpoint ?type=values):
+    {
+      "response": {
+        "type": "success",
+        "data": {
+          "nombre": "Sofia",
+          "apellidos": "Gonzalez Echevarria",
+          "nro_documento": "35363908",
+          "tipo_documento": "96",
+          "saludo": "buenas noches",
+          "empleado": "SI",
+          "paquetes": [...],
+          "segmento": { "tipo": "01", "descripcion": "COMAFI UNICO BLACK" }
+        }
+      }
+    }
     """
-    cliente = data.get("cliente") or data.get("data") or data
+    # Desempaquetar el wrapper response.data
+    response_wrapper = raw.get("response") or {}
+    if isinstance(response_wrapper, dict):
+        data = response_wrapper.get("data") or {}
+    else:
+        data = {}
 
-    if not cliente:
+    # Fallback por si la estructura varía
+    if not data:
+        data = raw.get("data") or raw.get("cliente") or raw
+
+    if not data:
         return UserProfile(phone_number=phone_number, identificado=False)
 
-    nombre = (cliente.get("nombre") or "").strip().title() or None
-    apellido = (cliente.get("apellido") or "").strip().title() or None
-    nombre_completo = f"{nombre} {apellido}".strip() if (nombre or apellido) else None
+    nombre = (data.get("nombre") or "").strip().title() or None
+    # La API usa "apellidos" (plural)
+    apellido = (
+        data.get("apellidos") or data.get("apellido") or ""
+    ).strip().title() or None
+    nombre_completo = (
+        f"{nombre} {apellido}".strip() if (nombre or apellido) else None
+    )
 
-    # Extraer productos (tarjetas / cuentas)
+    # segmento viene como objeto {"tipo": "01", "descripcion": "COMAFI UNICO BLACK"}
+    seg_raw = data.get("segmento")
+    if isinstance(seg_raw, dict):
+        segmento = seg_raw.get("descripcion") or seg_raw.get("tipo")
+    else:
+        segmento = seg_raw or data.get("segment")
+    if segmento:
+        segmento = str(segmento).strip()
+
+    # productos / paquetes
     productos: list[str] = []
-    raw_products = cliente.get("productos") or cliente.get("tarjetas") or []
+    raw_products = (
+        data.get("paquetes")
+        or data.get("productos")
+        or data.get("tarjetas")
+        or []
+    )
     if isinstance(raw_products, list):
         for p in raw_products:
             if isinstance(p, dict):
-                label = p.get("descripcion") or p.get("nombre") or p.get("tipo")
+                label = (
+                    p.get("descripcion")
+                    or p.get("nombre")
+                    or p.get("tipo")
+                )
                 if label:
                     productos.append(str(label))
-            elif isinstance(p, str):
+            elif isinstance(p, str) and p:
                 productos.append(p)
+
+    nro_doc = str(
+        data.get("nro_documento") or data.get("nroDocumento") or ""
+    ).strip() or None
+    tipo_doc = (
+        data.get("tipo_documento") or data.get("tipoDocumento")
+    )
+    if tipo_doc:
+        tipo_doc = str(tipo_doc).strip()
 
     return UserProfile(
         phone_number=phone_number,
         nombre=nombre,
         apellido=apellido,
         nombre_completo=nombre_completo,
-        segmento=cliente.get("segmento") or cliente.get("segment"),
-        nro_documento=str(
-            cliente.get("nroDocumento") or cliente.get("nro_documento") or ""
-        ),
-        tipo_documento=cliente.get("tipoDocumento") or cliente.get("tipo_documento"),
+        segmento=segmento,
+        nro_documento=nro_doc,
+        tipo_documento=tipo_doc,
         productos=productos,
         identificado=True,
     )
@@ -121,14 +173,20 @@ def _parse_profile(phone_number: str, data: dict) -> UserProfile:
 
 async def _fetch_from_sofia(phone_number: str) -> Optional[dict]:
     """
-    Llama a sofia-api-users GET /users/:userId para identificar al usuario.
+    Llama a sofia-api-users GET /users/:userId?type=values.
 
-    Retorna el dict de respuesta o None si falla.
+    No requiere token de autenticación.
+    Retorna el dict de respuesta completo o None si falla.
     """
-    url = f"{SOFIA_API_URL.rstrip('/')}/users/{phone_number}"
+    base = (SOFIA_API_URL or "").rstrip("/")
+    url = f"{base}/users/{phone_number}?type=values"
     headers: dict = {"Content-Type": "application/json"}
+    # Token opcional — la API real no lo requiere pero lo soportamos
+    # por si el entorno lo necesita
     if SOFIA_API_TOKEN:
         headers["Authorization"] = f"Bearer {SOFIA_API_TOKEN}"
+
+    print(f"[UserProfile] GET {url}")
 
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
@@ -137,22 +195,27 @@ async def _fetch_from_sofia(phone_number: str) -> Optional[dict]:
                 return response.json()
             elif response.status_code == 404:
                 print(
-                    f"[UserProfile] Usuario no encontrado en sofia: {phone_number[-4:]}"
+                    f"[UserProfile] Usuario no encontrado en sofia: "
+                    f"{phone_number[-4:]}"
                 )
                 return None
             else:
                 print(
-                    f"[UserProfile] sofia-api-users respondió {response.status_code} "
-                    f"para {phone_number[-4:]}"
+                    f"[UserProfile] sofia-api-users respondió "
+                    f"{response.status_code} para {phone_number[-4:]}"
                 )
                 return None
     except httpx.TimeoutException:
         print(
-            f"[UserProfile] Timeout al llamar sofia-api-users para {phone_number[-4:]}"
+            f"[UserProfile] Timeout al llamar sofia-api-users para "
+            f"{phone_number[-4:]}"
         )
         return None
     except httpx.ConnectError:
-        print(f"[UserProfile] No se pudo conectar a sofia-api-users ({SOFIA_API_URL})")
+        print(
+            f"[UserProfile] No se pudo conectar a sofia-api-users "
+            f"({SOFIA_API_URL})"
+        )
         return None
     except Exception as e:
         print(f"[UserProfile] Error inesperado: {e}")
@@ -183,8 +246,17 @@ async def fetch_user_profile(phone_number: str) -> UserProfile:
 
     # ── Mock: retorno inmediato sin Redis ni HTTP ─────────────────────
     if MOCK_ENABLED:
-        mock_data = get_mock_profile(normalized)
-        profile = UserProfile(**mock_data)
+        mock_raw = get_mock_profile(normalized)
+        # mock_raw=None → usuario no identificado (mismo que 404 en producción)
+        if mock_raw is None:
+            profile = UserProfile(
+                phone_number=normalized,
+                identificado=False,
+                error="Usuario no identificado en el sistema bancario",
+            )
+        else:
+            # Usa el mismo _parse_profile que producción
+            profile = _parse_profile(normalized, mock_raw)
         status = "identificado" if profile.identificado else "no identificado"
         print(
             f"[UserProfile][MOCK] {status}: "
