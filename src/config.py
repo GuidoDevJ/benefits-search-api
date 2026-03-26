@@ -16,9 +16,7 @@ BEDROCK_MODEL_ID = os.getenv(
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
-# Sofia API Users (identificación de usuario por WhatsApp)
-SOFIA_API_URL = os.getenv("SOFIA_API_URL")
-SOFIA_API_TOKEN = os.getenv("SOFIA_API_TOKEN")
+# Identificación de usuario por WhatsApp (sofia-api-users)
 USER_IDENTIFICATION_ENABLED = (
     os.getenv("USER_IDENTIFICATION_ENABLED", "true").lower() == "true"
 )

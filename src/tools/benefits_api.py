@@ -220,6 +220,35 @@ def _apply_filters(data: List[dict], params: dict) -> List[dict]:
     return filtered
 
 
+def _parse_discount(d_str: str) -> float:
+    """
+    Extrae el primer número de un string de descuento.
+
+    Ejemplos:
+      "20%"            → 20.0
+      "15 %"           → 15.0
+      "20% + 3 cuotas" → 20.0
+      "3 cuotas s/i"   → 0.0  (sin porcentaje)
+      ""               → 0.0
+    """
+    import re
+    if not d_str:
+        return 0.0
+    match = re.search(r"(\d+(?:[.,]\d+)?)", str(d_str))
+    if not match:
+        return 0.0
+    return float(match.group(1).replace(",", "."))
+
+
+def _sort_by_discount(data: List[dict]) -> List[dict]:
+    """
+    Ordena los beneficios de mayor a menor porcentaje de descuento.
+
+    Preserva el orden relativo entre items con el mismo descuento.
+    """
+    return sorted(data, key=lambda item: _parse_discount(item.get("d", "")), reverse=True)
+
+
 def _prioritize(data: List[dict], params: dict) -> List[dict]:
     """
     Reordena beneficios poniendo los exclusivos del segmento primero.
@@ -312,19 +341,20 @@ async def fetch_benefits(
                 status_code=0,
             )
 
-        # Filtrar → priorizar → limitar a top 10
+        # Filtrar → priorizar → ordenar por descuento
         filtered = _apply_filters(all_benefits, filter_params)
         prioritized = _prioritize(filtered, filter_params)
+        sorted_data = _sort_by_discount(prioritized)
 
         print(
             f"[Benefits] {len(all_benefits)} total -> "
             f"{len(filtered)} filtrados -> "
-            f"{len(prioritized)} priorizados"
+            f"{len(sorted_data)} ordenados"
         )
 
         return BenefitsResponse(
             success=True,
-            data=prioritized,
+            data=sorted_data,
             url="(from-daily-cache)",
             status_code=200,
         )
@@ -412,12 +442,17 @@ async def search_benefits_with_profile(
 
     response = await fetch_benefits(entities, user_profile=user_profile)
 
-    top = (response.data or [])[offset:offset + 5]
+    all_data = response.data or []
+    total = len(all_data)
+    top = all_data[offset:offset + 5]
     datas_json = [normalize_promo(b.model_dump()) for b in top]
 
     result: dict = {
         "data": datas_json,
-        "total_found": len(response.data or []),
+        # mostrando = cantidad REAL en data[] — el LLM usa este número
+        "mostrando": len(datas_json),
+        # hay_mas = si existe una página siguiente
+        "hay_mas": (offset + 5) < total,
     }
     if response.error:
         result["error"] = response.error

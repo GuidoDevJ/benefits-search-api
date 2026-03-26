@@ -1,12 +1,12 @@
 """
 User Profile Tool — Identifica al usuario por número de WhatsApp.
 
-Llama al microservicio sofia-api-users para obtener el perfil del cliente
-(nombre, segmento, productos, documentación) y lo cachea en Redis (TTL: 30 min).
+Llama directamente al microservicio sofia-api-users.
+Cachea el perfil en Redis (TTL: 30 min).
 
-Variables de entorno requeridas:
-    SOFIA_API_URL: URL base del microservicio (ej: http://sofia-api-users:3000)
-    SOFIA_API_TOKEN: Bearer token para autenticación (opcional)
+Variable de entorno requerida:
+    SOFIA_API_URL: URL base de sofia-api-users
+                   (ej: https://sofia-users-api-prod.apps.prod-ocp.bue299.comafi.com.ar)
 
 Clave Redis: comafi:user_profile:{phone_number}
 TTL: 1800 segundos (30 minutos)
@@ -28,11 +28,10 @@ except ImportError:
 
 
 # ── Configuración ─────────────────────────────────────────────────────────
-SOFIA_API_URL = os.getenv("SOFIA_API_URL")
-SOFIA_API_TOKEN = os.getenv("SOFIA_API_TOKEN", "")
+SOFIA_API_URL = os.getenv("SOFIA_API_URL", "")
+REQUEST_TIMEOUT = int(os.getenv("SOFIA_API_TIMEOUT", "10"))
 USER_PROFILE_CACHE_KEY_PREFIX = "comafi:user_profile:"
 USER_PROFILE_CACHE_TTL = int(os.getenv("USER_PROFILE_CACHE_TTL", "1800"))
-REQUEST_TIMEOUT = int(os.getenv("SOFIA_API_TIMEOUT", "5"))
 MOCK_ENABLED = os.getenv("MOCK_USER_PROFILE", "false").lower() == "true"
 
 
@@ -71,41 +70,35 @@ class UserProfile(BaseModel):
 
 
 def _normalize_phone(phone_number: str) -> str:
-    """Normaliza el número de teléfono para usar como userId."""
-    return "".join(c for c in phone_number if c.isdigit() or c == "+")
+    """Normaliza el número de teléfono (solo dígitos) para usar como userId en la URL."""
+    return "".join(c for c in phone_number if c.isdigit())
 
 
 def _parse_profile(phone_number: str, raw: dict) -> UserProfile:
     """
-    Parsea la respuesta de sofia-api-users al modelo UserProfile.
+    Parsea el dict `data` de sofia-api-users al modelo UserProfile.
 
-    Estructura real de la API (endpoint ?type=values):
+    Recibe el contenido YA desempaquetado por SofiaUsersClient._unwrap:
     {
-      "response": {
-        "type": "success",
-        "data": {
-          "nombre": "Sofia",
-          "apellidos": "Gonzalez Echevarria",
-          "nro_documento": "35363908",
-          "tipo_documento": "96",
-          "saludo": "buenas noches",
-          "empleado": "SI",
-          "paquetes": [...],
-          "segmento": { "tipo": "01", "descripcion": "COMAFI UNICO BLACK" }
-        }
-      }
+      "nombre": "Sofia",
+      "apellidos": "Gonzalez Echevarria",
+      "nro_documento": "35363908",
+      "tipo_documento": "96",
+      "saludo": "buenas noches",
+      "empleado": "SI",
+      "paquetes": [...],
+      "segmento": { "tipo": "01", "descripcion": "COMAFI UNICO BLACK" }
     }
-    """
-    # Desempaquetar el wrapper response.data
-    response_wrapper = raw.get("response") or {}
-    if isinstance(response_wrapper, dict):
-        data = response_wrapper.get("data") or {}
-    else:
-        data = {}
 
-    # Fallback por si la estructura varía
-    if not data:
-        data = raw.get("data") or raw.get("cliente") or raw
+    En modo mock los datos vienen en el mismo formato (mocks usan
+    la estructura completa de la API real).
+    """
+    # En mock el raw puede venir aún envuelto en response.data — fallback defensivo
+    if "response" in raw:
+        inner = (raw.get("response") or {}).get("data") or {}
+        data = inner or raw
+    else:
+        data = raw
 
     if not data:
         return UserProfile(phone_number=phone_number, identificado=False)
@@ -173,52 +166,42 @@ def _parse_profile(phone_number: str, raw: dict) -> UserProfile:
 
 async def _fetch_from_sofia(phone_number: str) -> Optional[dict]:
     """
-    Llama a sofia-api-users GET /users/:userId?type=values.
+    Llama a GET {SOFIA_API_URL}/users/{phone}?type=values.
 
-    No requiere token de autenticación.
-    Retorna el dict de respuesta completo o None si falla.
+    Retorna el dict completo de la respuesta, o None si el usuario
+    no existe (404) o hay error de conexión.
     """
-    base = (SOFIA_API_URL or "").rstrip("/")
-    url = f"{base}/users/{phone_number}?type=values"
-    headers: dict = {"Content-Type": "application/json"}
-    # Token opcional — la API real no lo requiere pero lo soportamos
-    # por si el entorno lo necesita
-    if SOFIA_API_TOKEN:
-        headers["Authorization"] = f"Bearer {SOFIA_API_TOKEN}"
-
+    url = f"{SOFIA_API_URL.rstrip('/')}/users/{phone_number}?type=values"
     print(f"[UserProfile] GET {url}")
-
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            response = await client.get(url, headers=headers)
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 404:
-                print(
-                    f"[UserProfile] Usuario no encontrado en sofia: "
-                    f"{phone_number[-4:]}"
-                )
-                return None
-            else:
-                print(
-                    f"[UserProfile] sofia-api-users respondió "
-                    f"{response.status_code} para {phone_number[-4:]}"
-                )
-                return None
-    except httpx.TimeoutException:
+        async with httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT,
+            verify=False,
+        ) as client:
+            response = await client.get(
+                url,
+                headers={"Content-Type": "application/json"},
+            )
+
+        if response.status_code == 200:
+            return response.json()
+        if response.status_code == 404:
+            print(f"[UserProfile] Usuario no encontrado: ...{phone_number[-4:]}")
+            return None
         print(
-            f"[UserProfile] Timeout al llamar sofia-api-users para "
-            f"{phone_number[-4:]}"
+            f"[UserProfile] sofia-api-users respondió "
+            f"{response.status_code} para ...{phone_number[-4:]}"
         )
+        return None
+
+    except httpx.TimeoutException:
+        print(f"[UserProfile] Timeout para ...{phone_number[-4:]}")
         return None
     except httpx.ConnectError:
-        print(
-            f"[UserProfile] No se pudo conectar a sofia-api-users "
-            f"({SOFIA_API_URL})"
-        )
+        print(f"[UserProfile] No se pudo conectar a {SOFIA_API_URL}")
         return None
-    except Exception as e:
-        print(f"[UserProfile] Error inesperado: {e}")
+    except Exception as exc:
+        print(f"[UserProfile] Error inesperado: {exc}")
         return None
 
 
