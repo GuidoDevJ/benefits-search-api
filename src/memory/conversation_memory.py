@@ -30,6 +30,10 @@ MEMORY_KEY_PREFIX = "comafi:memory:"
 DEFAULT_TTL = int(os.getenv("MEMORY_TTL_SECONDS", str(24 * 3600)))   # 24h
 DEFAULT_MAX_MESSAGES = int(os.getenv("MEMORY_MAX_MESSAGES", "20"))    # ventana de 20 mensajes
 
+# Fallback en memoria cuando Redis no está disponible (dev local / caída temporal).
+# Persiste mientras el proceso esté vivo; se pierde al reiniciar.
+_memory_fallback: dict[str, list[dict]] = {}
+
 
 def _serialize_message(msg: BaseMessage) -> dict:
     """Serializa un mensaje LangChain a dict JSON-compatible."""
@@ -75,76 +79,72 @@ class ConversationMemoryService:
     async def load_history(self, phone_number: str) -> list[BaseMessage]:
         """
         Carga el historial de conversación del usuario desde Redis.
-
-        Args:
-            phone_number: Número de WhatsApp del usuario
-
-        Returns:
-            Lista de mensajes LangChain (HumanMessage / AIMessage)
+        Fallback a memoria si Redis no está disponible.
         """
+        key = self._make_key(phone_number)
         if not await self._ensure_connected():
-            return []
+            data = _memory_fallback.get(key, [])
+            return [_deserialize_message(m) for m in data]
 
         try:
-            key = self._make_key(phone_number)
             raw = await self._redis.client.get(key)
             if not raw:
                 return []
-
             data = json.loads(raw)
             messages = [_deserialize_message(m) for m in data]
-            print(f"[Memory] Historial cargado: {len(messages)} mensajes para {phone_number[-4:]}")
+            tail = phone_number[-4:]
+            print(f"[Memory] Cargados {len(messages)} msgs ({tail})")
             return messages
 
         except Exception as e:
             print(f"[Memory] Error al cargar historial: {e}")
-            return []
+            data = _memory_fallback.get(key, [])
+            return [_deserialize_message(m) for m in data]
 
-    async def save_messages(self, phone_number: str, new_messages: list[BaseMessage]) -> bool:
+    async def save_messages(
+        self,
+        phone_number: str,
+        new_messages: list[BaseMessage],
+    ) -> bool:
         """
-        Agrega nuevos mensajes al historial y recorta a la ventana máxima.
-
-        Solo persiste HumanMessage y AIMessage (ignora SystemMessage).
-
-        Args:
-            phone_number: Número de WhatsApp del usuario
-            new_messages: Mensajes nuevos a agregar
-
-        Returns:
-            True si se guardó correctamente
+        Agrega nuevos mensajes al historial (ventana máxima).
+        Fallback a memoria si Redis no está disponible.
+        Solo persiste HumanMessage y AIMessage.
         """
+        key = self._make_key(phone_number)
+        new_serialized = [
+            _serialize_message(m)
+            for m in new_messages
+            if isinstance(m, (HumanMessage, AIMessage))
+        ]
+
         if not await self._ensure_connected():
-            return False
+            existing = list(_memory_fallback.get(key, []))
+            combined = (existing + new_serialized)[-self._max_messages:]
+            _memory_fallback[key] = combined
+            return True
 
         try:
-            key = self._make_key(phone_number)
-
-            # Cargar historial actual
             existing: list[dict] = []
             raw = await self._redis.client.get(key)
             if raw:
                 existing = json.loads(raw)
 
-            # Serializar solo mensajes persistibles (no SystemMessage)
-            new_serialized = [
-                _serialize_message(m)
-                for m in new_messages
-                if isinstance(m, (HumanMessage, AIMessage))
-            ]
-
-            # Combinar y recortar a ventana máxima
-            combined = existing + new_serialized
-            if len(combined) > self._max_messages:
-                combined = combined[-self._max_messages:]
-
-            # Persistir con TTL renovado
-            await self._redis.client.setex(key, self._ttl, json.dumps(combined, ensure_ascii=False))
-            print(f"[Memory] Historial guardado: {len(combined)} mensajes para {phone_number[-4:]}")
+            combined = (existing + new_serialized)[-self._max_messages:]
+            await self._redis.client.setex(
+                key, self._ttl,
+                json.dumps(combined, ensure_ascii=False),
+            )
+            tail = phone_number[-4:]
+            print(f"[Memory] Guardados {len(combined)} msgs ({tail})")
             return True
 
         except Exception as e:
             print(f"[Memory] Error al guardar historial: {e}")
-            return False
+            existing = list(_memory_fallback.get(key, []))
+            combined = (existing + new_serialized)[-self._max_messages:]
+            _memory_fallback[key] = combined
+            return True
 
     async def clear(self, phone_number: str) -> bool:
         """

@@ -24,6 +24,11 @@ USER_IDENTIFICATION_ENABLED = (
 MOCK_USER_PROFILE = (
     os.getenv("MOCK_USER_PROFILE", "false").lower() == "true"
 )
+# Mock de beneficios (desarrollo local — saltea TeVaBien y devuelve datos
+# falsos por state_id para probar el flujo provincia → zonas → filtrado)
+MOCK_BENEFITS = (
+    os.getenv("MOCK_BENEFITS", "false").lower() == "true"
+)
 
 # Memoria conversacional (Redis)
 MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "true").lower() == "true"

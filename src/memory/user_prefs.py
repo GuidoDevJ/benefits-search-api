@@ -27,6 +27,10 @@ except ImportError:
 PREFS_KEY_PREFIX = "comafi:prefs:"
 PREFS_TTL = 30 * 24 * 3600  # 30 días
 
+# Fallback en memoria cuando Redis no está disponible (ej: dev local).
+# Persiste mientras el proceso esté vivo; se pierde al reiniciar.
+_memory_fallback: dict[str, dict] = {}
+
 
 class UserPrefsService:
     """Preferencias persistentes del usuario almacenadas en Redis."""
@@ -47,24 +51,25 @@ class UserPrefsService:
 
     async def load(self, phone: str) -> dict:
         """Carga las preferencias del usuario. Retorna {} si no existen."""
+        key = self._make_key(phone)
         if not await self._ensure_connected():
-            return {}
+            return dict(_memory_fallback.get(key, {}))
         try:
-            key = self._make_key(phone)
             raw = await self._redis.client.get(key)
             if not raw:
                 return {}
             return json.loads(raw)
         except Exception as e:
             print(f"[Prefs] Error al cargar preferencias: {e}")
-            return {}
+            return dict(_memory_fallback.get(key, {}))
 
     async def save(self, phone: str, prefs: dict) -> bool:
         """Persiste el dict completo de preferencias (sobrescribe)."""
+        key = self._make_key(phone)
         if not await self._ensure_connected():
-            return False
+            _memory_fallback[key] = dict(prefs)
+            return True
         try:
-            key = self._make_key(phone)
             await self._redis.client.setex(
                 key, PREFS_TTL,
                 json.dumps(prefs, ensure_ascii=False),
@@ -72,7 +77,8 @@ class UserPrefsService:
             return True
         except Exception as e:
             print(f"[Prefs] Error al guardar preferencias: {e}")
-            return False
+            _memory_fallback[key] = dict(prefs)
+            return True
 
     async def update(self, phone: str, **kwargs) -> bool:
         """Actualiza uno o más campos sin pisar el resto."""
@@ -125,22 +131,33 @@ class UserPrefsService:
         dias: Optional[list],
     ) -> bool:
         """
-        Incrementa contadores de categoría y días para detectar preferencias.
+        Incrementa contadores de categoría y días, y guarda recencia.
 
-        Umbral de preferencia: ≥ 2 usos → se considera favorito del usuario.
+        Umbral de preferencia: >= 2 usos → se considera favorito.
+        Persiste también last_categoria y last_searched_at para
+        permitir continuidad entre sesiones.
         """
         if not categoria and not dias:
             return True
+
+        from datetime import datetime, timezone
         prefs = await self.load(phone)
+
         if categoria:
             counts = prefs.get("cat_counts", {})
             counts[categoria] = counts.get(categoria, 0) + 1
             prefs["cat_counts"] = counts
+            prefs["last_categoria"] = categoria
+
         if dias:
             day_counts = prefs.get("day_counts", {})
             for dia in dias:
                 day_counts[dia] = day_counts.get(dia, 0) + 1
             prefs["day_counts"] = day_counts
+
+        prefs["last_searched_at"] = (
+            datetime.now(timezone.utc).isoformat()
+        )
         return await self.save(phone, prefs)
 
     @staticmethod

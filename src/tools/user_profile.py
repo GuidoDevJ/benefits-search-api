@@ -4,6 +4,17 @@ User Profile Tool — Identifica al usuario por número de WhatsApp.
 Llama directamente al microservicio sofia-api-users.
 Cachea el perfil en Redis (TTL: 30 min).
 
+Endpoint:
+    GET {SOFIA_API_URL}/users/v2/{phone}/complements
+
+Estructura de respuesta:
+    response.data.consolidated_position.cliente_datos_personales
+        → tipo_cliente (segmento), domicilios[].provincia, empleado
+    response.data.consolidated_position.posicion_consolidada
+        → productos_cliente.productos[].id_producto.definicion_producto.{grupo,subgrupo}
+    response.data.client_information
+        → nombre, apellido, tipo_documento, numero_documento
+
 Variable de entorno requerida:
     SOFIA_API_URL: URL base de sofia-api-users
                    (ej: https://sofia-users-api-prod.apps.prod-ocp.bue299.comafi.com.ar)
@@ -46,6 +57,7 @@ class UserProfile(BaseModel):
     nro_documento: Optional[str] = None
     tipo_documento: Optional[str] = None  # DNI, CUIL, CUIT
     productos: list[str] = []  # Tarjetas / productos activos
+    provincia: Optional[str] = None  # Provincia del domicilio principal
     identificado: bool = False  # True si se encontró en el banco
     error: Optional[str] = None  # Mensaje de error si falla
 
@@ -66,6 +78,8 @@ class UserProfile(BaseModel):
             lines.append(f"- Segmento: {self.segmento}")
         if self.productos:
             lines.append(f"- Productos: {', '.join(self.productos)}")
+        if self.provincia:
+            lines.append(f"- Provincia: {self.provincia}")
         return "Información del cliente identificado:\n" + "\n".join(lines)
 
 
@@ -76,80 +90,89 @@ def _normalize_phone(phone_number: str) -> str:
 
 def _parse_profile(phone_number: str, raw: dict) -> UserProfile:
     """
-    Parsea el dict `data` de sofia-api-users al modelo UserProfile.
+    Parsea la respuesta de GET /users/v2/{phone}/complements al modelo UserProfile.
 
-    Recibe el contenido YA desempaquetado por SofiaUsersClient._unwrap:
+    Estructura esperada:
     {
-      "nombre": "Sofia",
-      "apellidos": "Gonzalez Echevarria",
-      "nro_documento": "35363908",
-      "tipo_documento": "96",
-      "saludo": "buenas noches",
-      "empleado": "SI",
-      "paquetes": [...],
-      "segmento": { "tipo": "01", "descripcion": "COMAFI UNICO BLACK" }
+      "response": {
+        "type": "success",
+        "data": {
+          "consolidated_position": {
+            "cliente_datos_personales": {
+              "nombre": "...", "apellido": "...",
+              "tipo_cliente": "COMAFI PREMIUM GOLD",
+              "domicilios": [{"provincia": "CORDOBA", ...}]
+            },
+            "posicion_consolidada": {
+              "productos_cliente": {
+                "productos": [
+                  {"id_producto": {"definicion_producto": {"grupo": "MASTERCARD", "subgrupo": "MASTER GOLD"}}}
+                ]
+              }
+            }
+          },
+          "client_information": {
+            "tipo_documento": "DNI",
+            "numero_documento": "12506320",
+            "nombre": "FERNANDO DANIEL",
+            "apellido": "ESCALANTE"
+          }
+        }
+      }
     }
-
-    En modo mock los datos vienen en el mismo formato (mocks usan
-    la estructura completa de la API real).
     """
-    # En mock el raw puede venir aún envuelto en response.data — fallback defensivo
+    # Desempaquetar response.data
+    data = {}
     if "response" in raw:
-        inner = (raw.get("response") or {}).get("data") or {}
-        data = inner or raw
+        data = (raw.get("response") or {}).get("data") or {}
     else:
         data = raw
 
     if not data:
         return UserProfile(phone_number=phone_number, identificado=False)
 
-    nombre = (data.get("nombre") or "").strip().title() or None
-    # La API usa "apellidos" (plural)
-    apellido = (
-        data.get("apellidos") or data.get("apellido") or ""
-    ).strip().title() or None
+    # ── client_information: nombre, apellido, documento ──────────────────
+    client_info = data.get("client_information") or {}
+    nombre = (client_info.get("nombre") or "").strip().title() or None
+    apellido = (client_info.get("apellido") or "").strip().title() or None
     nombre_completo = (
         f"{nombre} {apellido}".strip() if (nombre or apellido) else None
     )
+    nro_doc = str(client_info.get("numero_documento") or "").strip() or None
+    tipo_doc = str(client_info.get("tipo_documento") or "").strip() or None
 
-    # segmento viene como objeto {"tipo": "01", "descripcion": "COMAFI UNICO BLACK"}
-    seg_raw = data.get("segmento")
-    if isinstance(seg_raw, dict):
-        segmento = seg_raw.get("descripcion") or seg_raw.get("tipo")
-    else:
-        segmento = seg_raw or data.get("segment")
-    if segmento:
-        segmento = str(segmento).strip()
+    # ── consolidated_position ────────────────────────────────────────────
+    consolidated = data.get("consolidated_position") or {}
+    cliente_dp = consolidated.get("cliente_datos_personales") or {}
 
-    # productos / paquetes
+    # segmento: tipo_cliente (ej: "COMAFI PREMIUM GOLD")
+    segmento = str(cliente_dp.get("tipo_cliente") or "").strip() or None
+
+    # provincia: primer domicilio con campo "provincia"
+    provincia = None
+    domicilios = cliente_dp.get("domicilios") or []
+    for dom in domicilios:
+        if isinstance(dom, dict) and dom.get("provincia"):
+            provincia = str(dom["provincia"]).strip().title() or None
+            break
+
+    # productos: grupo + subgrupo de cada producto de la posición consolidada
     productos: list[str] = []
-    raw_products = (
-        data.get("paquetes")
-        or data.get("productos")
-        or data.get("tarjetas")
-        or []
-    )
-    if isinstance(raw_products, list):
-        for p in raw_products:
-            if isinstance(p, dict):
-                label = (
-                    p.get("descripcion")
-                    or p.get("nombre")
-                    or p.get("tipo")
-                )
-                if label:
-                    productos.append(str(label))
-            elif isinstance(p, str) and p:
-                productos.append(p)
-
-    nro_doc = str(
-        data.get("nro_documento") or data.get("nroDocumento") or ""
-    ).strip() or None
-    tipo_doc = (
-        data.get("tipo_documento") or data.get("tipoDocumento")
-    )
-    if tipo_doc:
-        tipo_doc = str(tipo_doc).strip()
+    posicion = consolidated.get("posicion_consolidada") or {}
+    productos_cliente = posicion.get("productos_cliente") or {}
+    raw_productos = productos_cliente.get("productos") or []
+    for p in raw_productos:
+        if not isinstance(p, dict):
+            continue
+        defprod = (
+            (p.get("id_producto") or {})
+            .get("definicion_producto") or {}
+        )
+        grupo = str(defprod.get("grupo") or "").strip()
+        subgrupo = str(defprod.get("subgrupo") or "").strip()
+        label = f"{grupo} {subgrupo}".strip()
+        if label:
+            productos.append(label)
 
     return UserProfile(
         phone_number=phone_number,
@@ -160,18 +183,19 @@ def _parse_profile(phone_number: str, raw: dict) -> UserProfile:
         nro_documento=nro_doc,
         tipo_documento=tipo_doc,
         productos=productos,
+        provincia=provincia,
         identificado=True,
     )
 
 
 async def _fetch_from_sofia(phone_number: str) -> Optional[dict]:
     """
-    Llama a GET {SOFIA_API_URL}/users/{phone}?type=values.
+    Llama a GET {SOFIA_API_URL}/users/v2/{phone}/complements.
 
     Retorna el dict completo de la respuesta, o None si el usuario
     no existe (404) o hay error de conexión.
     """
-    url = f"{SOFIA_API_URL.rstrip('/')}/users/{phone_number}?type=values"
+    url = f"{SOFIA_API_URL.rstrip('/')}/users/v2/{phone_number}/complements"
     print(f"[UserProfile] GET {url}")
     try:
         async with httpx.AsyncClient(

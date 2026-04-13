@@ -14,6 +14,10 @@ Pipeline de filtrado (todo Python, sin LLM):
   5. _prioritize → beneficios del segmento del usuario van primero
 """
 
+import asyncio
+import hashlib
+import json
+import unicodedata
 from typing import Dict, List, Optional
 
 import httpx
@@ -23,8 +27,9 @@ from pydantic import BaseModel
 try:
     from .clasify_intent import build_filter_params
     from .normalizar import normalize_promo
+    from .benefits_mocks import get_mock_benefits
     from ..cache import get_cache_service
-    from ..config import CACHE_ENABLED
+    from ..config import CACHE_ENABLED, MOCK_BENEFITS
     from ..models.typed_entities import Entities
 except ImportError:
     import sys
@@ -36,9 +41,66 @@ except ImportError:
 
     from src.tools.clasify_intent import build_filter_params
     from src.tools.normalizar import normalize_promo
+    from src.tools.benefits_mocks import get_mock_benefits
     from src.cache import get_cache_service
-    from src.config import CACHE_ENABLED
+    from src.config import CACHE_ENABLED, MOCK_BENEFITS
     from src.models.typed_entities import Entities
+
+
+# ── Mapa provincia → state IDs (TeVaBien) ────────────────────────────────
+# Provincias con múltiples IDs (zonas internas) se consultan en paralelo.
+# Si la provincia no figura en el mapa → fallback a consulta global.
+
+PROVINCE_STATE_IDS: Dict[str, List[int]] = {
+    # GBA + interior bonaerense (muchas zonas internas en TeVaBien)
+    "BUENOS AIRES":                      [354, 338, 346, 351, 5, 345,
+                                          337, 352, 355, 344, 319, 310, 353],
+    # CABA: ciudad autónoma — state_id 310 (zona CABA en TeVaBien).
+    # Aliases frecuentes devueltos por sofia-api-users:
+    "CABA":                              [310],
+    "CIUDAD AUTONOMA DE BUENOS AIRES":   [310],
+    "CIUDAD DE BUENOS AIRES":            [310],
+    "CAPITAL FEDERAL":                   [310],
+    "CATAMARCA":                         [64],
+    "CHACO":                             [73],
+    "CHUBUT":                            [107],
+    "CORDOBA":                           [8, 343, 342],
+    "CORRIENTES":                        [70],
+    "ENTRE RIOS":                        [103],
+    "FORMOSA":                           [112],
+    "JUJUY":                             [61],
+    "LA PAMPA":                          [65],
+    "LA RIOJA":                          [316],
+    "MENDOZA":                           [7],
+    "MISIONES":                          [71],
+    "NEUQUEN":                           [72],
+    "RIO NEGRO":                         [63],
+    "SALTA":                             [62],
+    "SAN JUAN":                          [6],
+    "SAN LUIS":                          [26],
+    "SANTA CRUZ":                        [161],
+    "SANTA FE":                          [9],
+    "SANTIAGO DEL ESTERO":               [69],
+    "TIERRA DEL FUEGO":                  [75],
+    "TUCUMAN":                           [10],
+}
+
+
+def _normalize_provincia(name: str) -> str:
+    """Normaliza provincia a mayúsculas sin tildes para lookup en el mapa."""
+    nfkd = unicodedata.normalize("NFKD", name.upper())
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def _resolve_state_ids(provincia: Optional[str]) -> Optional[List[int]]:
+    """
+    Resuelve el/los state ID(s) de TeVaBien para la provincia del usuario.
+    Retorna None si no hay provincia o no está en el mapa (→ fallback global).
+    """
+    if not provincia:
+        return None
+    normalized = _normalize_provincia(provincia)
+    return PROVINCE_STATE_IDS.get(normalized) or None
 
 
 # ── Modelos ──────────────────────────────────────────────────────────────
@@ -74,18 +136,60 @@ class BenefitsResponse(BaseModel):
     status_code: int
 
 
-# ── Caché diario ─────────────────────────────────────────────────────────
+# ── Caché ────────────────────────────────────────────────────────────────
 
-CACHE_TTL_ALL_BENEFITS = 86400       # 24 horas
-CACHE_KEY_ALL_BENEFITS = "all_benefits"
+CACHE_TTL_ALL_BENEFITS = 86400   # 24 horas  — beneficios crudos de la API
+CACHE_TTL_SEARCH_RESULTS = 3600  #  1 hora   — resultados filtrados/ordenados
+
+
+def _build_search_cache_key(
+    entities: "Entities",
+    user_profile: Optional[dict],
+) -> str:
+    """
+    Genera la clave de caché para un conjunto de resultados filtrados.
+
+    La clave codifica todos los parámetros que determinan el resultado:
+    categoría, días, negocio, segmento, tipo de beneficio, provincia
+    del usuario y productos habilitados.
+
+    El offset (paginación) NO forma parte de la clave porque cacheamos
+    la lista completa y aplicamos el slice después.
+    """
+    profile = user_profile or {}
+    key_parts = {
+        "cat": entities.categoria,
+        "dias": sorted(entities.dias or []),
+        "neg": entities.negocio,
+        "seg": entities.segmento,
+        "tipo": entities.tipo_beneficio,
+        "prov": profile.get("provincia"),
+        "prods": sorted(
+            str(p) for p in (profile.get("productos") or [])
+        ),
+    }
+    key_str = json.dumps(key_parts, sort_keys=True, ensure_ascii=False)
+    h = hashlib.md5(key_str.encode()).hexdigest()
+    return f"benefits:search:{h}"
 
 
 async def _fetch_all_benefits_from_api(
     config: BenefitsAPIConfig,
     headers: Dict[str, str],
     timeout: int = 10,
+    state_id: Optional[int] = None,
 ) -> Optional[List[dict]]:
-    params = {"pagesize": config.default_pagesize, "allFields": ""}
+    label = f"state={state_id}" if state_id is not None else "global"
+
+    if MOCK_BENEFITS:
+        data = get_mock_benefits(state_id)
+        print(f"[Mock] Beneficios mock ({label}): {len(data)}")
+        return data
+
+    if state_id is not None:
+        params = {"pagesize": config.default_pagesize, "allfields": "", "state": state_id, "city": 0}
+    else:
+        params = {"pagesize": config.default_pagesize, "allFields": ""}
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.get(
@@ -93,41 +197,88 @@ async def _fetch_all_benefits_from_api(
             )
             response.raise_for_status()
             data = response.json()
-            print(f"[API] Beneficios obtenidos: {len(data)}")
+            print(f"[API] Beneficios obtenidos ({label}): {len(data)}")
             return data
     except Exception as e:
         print(f"[API] Error al obtener beneficios: {e}")
         return None
 
 
-async def _get_all_benefits_cached(
+async def _get_cached_for_state(
+    cache_key: str,
+    state_id: Optional[int],
     config: BenefitsAPIConfig,
     headers: Dict[str, str],
-    timeout: int = 10,
+    timeout: int,
 ) -> Optional[List[dict]]:
+    """Obtiene (o cachea) los beneficios para un único state_id (o global)."""
     if not CACHE_ENABLED:
-        return await _fetch_all_benefits_from_api(config, headers, timeout)
+        return await _fetch_all_benefits_from_api(config, headers, timeout, state_id)
 
     try:
         cache = await get_cache_service()
-        cached_data = await cache.get(CACHE_KEY_ALL_BENEFITS)
+        cached_data = await cache.get(cache_key)
         if cached_data is not None:
-            print(f"[Cache] HIT: {CACHE_KEY_ALL_BENEFITS}")
+            print(f"[Cache] HIT: {cache_key}")
             return cached_data
 
-        print(f"[Cache] MISS: {CACHE_KEY_ALL_BENEFITS} — llamando API...")
-        data = await _fetch_all_benefits_from_api(config, headers, timeout)
+        print(f"[Cache] MISS: {cache_key} — llamando API...")
+        data = await _fetch_all_benefits_from_api(config, headers, timeout, state_id)
 
         if data:
-            await cache.set(
-                CACHE_KEY_ALL_BENEFITS, data, ttl=CACHE_TTL_ALL_BENEFITS
-            )
-            print(f"[Cache] SET: {CACHE_KEY_ALL_BENEFITS} (TTL: 24h)")
+            await cache.set(cache_key, data, ttl=CACHE_TTL_ALL_BENEFITS)
+            print(f"[Cache] SET: {cache_key} (TTL: 24h)")
 
         return data
     except Exception as e:
         print(f"[Cache] Error: {e}")
-        return await _fetch_all_benefits_from_api(config, headers, timeout)
+        return await _fetch_all_benefits_from_api(config, headers, timeout, state_id)
+
+
+async def _get_all_benefits_cached(
+    config: BenefitsAPIConfig,
+    headers: Dict[str, str],
+    timeout: int = 10,
+    state_ids: Optional[List[int]] = None,
+) -> Optional[List[dict]]:
+    """
+    Obtiene beneficios cacheados por provincia (state_ids) o globales.
+
+    - Sin state_ids → consulta global sin filtro geográfico.
+    - Con un ID     → consulta + caché para ese estado.
+    - Con varios IDs (ej. Buenos Aires, Córdoba) → consulta en paralelo,
+      merge deduplicado por campo `i` (id beneficio).
+    """
+    if not state_ids:
+        return await _get_cached_for_state(
+            "all_benefits:global", None, config, headers, timeout
+        )
+
+    if len(state_ids) == 1:
+        key = f"all_benefits:state:{state_ids[0]}"
+        return await _get_cached_for_state(key, state_ids[0], config, headers, timeout)
+
+    # Múltiples zonas: fetch en paralelo, luego deduplicar por ID de beneficio
+    tasks = [
+        _get_cached_for_state(
+            f"all_benefits:state:{sid}", sid, config, headers, timeout
+        )
+        for sid in state_ids
+    ]
+    results = await asyncio.gather(*tasks)
+
+    seen: set = set()
+    merged: List[dict] = []
+    for chunk in results:
+        if chunk:
+            for item in chunk:
+                bid = item.get("i")
+                if bid not in seen:
+                    seen.add(bid)
+                    merged.append(item)
+
+    print(f"[Cache] Merge {len(state_ids)} zonas -> {len(merged)} beneficios unicos")
+    return merged or None
 
 
 # ── Filtrado (lógica pura, sin LLM) ──────────────────────────────────────────
@@ -328,9 +479,16 @@ async def fetch_benefits(
     filter_params = build_filter_params(entities, user_profile)
     print(f"[Benefits] filter_params={filter_params}")
 
+    # Resolver state IDs a partir de la provincia del perfil
+    provincia = (user_profile or {}).get("provincia")
+    state_ids = _resolve_state_ids(provincia)
+    if provincia:
+        label = f"{provincia} → state_ids={state_ids}" if state_ids else f"{provincia} → fallback global"
+        print(f"[Benefits] {label}")
+
     try:
         all_benefits = await _get_all_benefits_cached(
-            config, headers, timeout
+            config, headers, timeout, state_ids=state_ids
         )
 
         if all_benefits is None:
@@ -424,6 +582,16 @@ async def search_benefits_with_profile(
     Llamada directamente desde benefits_agent (no por el LLM).
     Aplica filtrado y priorización por segmento del usuario.
 
+    Estrategia de caché (1h TTL):
+      - Clave: hash de (categoria, dias, negocio, segmento, tipo_beneficio,
+        provincia, productos).  El offset NO forma parte de la clave.
+      - Se cachea la lista completa normalizada (todos los resultados
+        filtrados, no solo el top-5). El slice por offset se aplica
+        sobre la lista cacheada.
+      - Invalidación implícita: el TTL es inferior al de all_benefits
+        (24h), por lo que siempre expira antes de que el dataset diario
+        se renueve.
+
     Args:
         query:        Texto original del usuario (para logging)
         entities:     Entidades ya clasificadas
@@ -435,35 +603,78 @@ async def search_benefits_with_profile(
     """
     print(
         f"[search_benefits_with_profile] query='{query}' | "
-        f"categoria={entities.categoria}, dias={entities.dias}, "
-        f"negocio={entities.negocio}, "
-        f"segmento={entities.segmento or 'N/A'}, offset={offset}"
+        f"cat={entities.categoria}, dias={entities.dias}, "
+        f"neg={entities.negocio}, "
+        f"seg={entities.segmento or 'N/A'}, offset={offset}"
     )
 
-    response = await fetch_benefits(entities, user_profile=user_profile)
+    # ── Intento de caché ──────────────────────────────────────────────
+    cache_key = _build_search_cache_key(entities, user_profile)
+    all_normalized: Optional[List[dict]] = None
+    api_error: Optional[str] = None
 
-    all_data = response.data or []
-    total = len(all_data)
-    top = all_data[offset:offset + 5]
-    datas_json = [normalize_promo(b.model_dump()) for b in top]
+    if CACHE_ENABLED:
+        try:
+            cache = await get_cache_service()
+            cached = await cache.get(cache_key)
+            if cached is not None:
+                print(
+                    f"[Cache] HIT search: {cache_key[-12:]} "
+                    f"({len(cached)} items)"
+                )
+                all_normalized = cached
+        except Exception as ce:
+            print(f"[Cache] Error leyendo search cache: {ce}")
+
+    # ── Cache MISS: ejecutar filtrado completo ────────────────────────
+    if all_normalized is None:
+        response = await fetch_benefits(
+            entities, user_profile=user_profile
+        )
+        all_data = response.data or []
+        # Normalizar TODOS los items (no solo el top-5)
+        # para poder paginar correctamente desde el caché.
+        all_normalized = [
+            normalize_promo(b.model_dump()) for b in all_data
+        ]
+        api_error = response.error
+
+        if CACHE_ENABLED and all_normalized:
+            try:
+                cache = await get_cache_service()
+                await cache.set(
+                    cache_key,
+                    all_normalized,
+                    ttl=CACHE_TTL_SEARCH_RESULTS,
+                )
+                print(
+                    f"[Cache] SET search: {cache_key[-12:]} "
+                    f"({len(all_normalized)} items, TTL=1h)"
+                )
+            except Exception as ce:
+                print(f"[Cache] Error guardando search cache: {ce}")
+
+    # ── Paginación sobre la lista completa (cacheada o recién filtrada) ─
+    total = len(all_normalized)
+    top = all_normalized[offset:offset + 5]
+    mostrando = len(top)
+    restantes = max(0, total - offset - mostrando)
 
     result: dict = {
-        "data": datas_json,
-        # mostrando = cantidad REAL en data[] — el LLM usa este número
-        "mostrando": len(datas_json),
-        # hay_mas = si existe una página siguiente
-        "hay_mas": (offset + 5) < total,
+        "data": top,
+        "total": total,
+        "mostrando": mostrando,
+        "restantes": restantes,
+        "hay_mas": restantes > 0,
     }
-    if response.error:
-        result["error"] = response.error
+    if api_error:
+        result["error"] = api_error
     return result
 
 
 # ── Demo ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import asyncio
-
     async def main():
         query = "promociones en gastronomia"
         print(f"Query: {query}\n")

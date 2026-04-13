@@ -66,6 +66,14 @@ _VER_MAS_PHRASES = {
     "seguir viendo", "mas resultados", "siguiente pagina",
 }
 
+# Respuestas afirmativas cortas → se interpretan como "ver más"
+# Solo aplican cuando el mensaje tiene ≤ 3 tokens (evitar falsos positivos).
+_VER_MAS_AFFIRMATIVES = {
+    "dale", "si", "sí", "ok", "claro", "bueno", "va",
+    "genial", "perfecto", "listo", "vamos", "anda", "sí!",
+    "dale!", "ok!", "claro!", "bueno!", "si!", "va!",
+}
+
 # Preferencia de tipo de beneficio
 _BENEFIT_TYPE_PHRASES: list[tuple[str, str]] = [
     ("cuotas sin interes", "cuotas"),
@@ -281,6 +289,14 @@ def fast_classify(query: str) -> Optional[Classification]:
     for phrase in _VER_MAS_PHRASES:
         if phrase in text:
             return Classification(intent="ver_mas")
+
+    # Afirmativos puros (todos los tokens son afirmativos) → "ver más"
+    # Ej: "dale", "ok dale", "si claro", "sii", "daleee" → ver_mas
+    # "dale vuelta", "bueno pero quiero sushi" → LLM
+    # Se colapsan caracteres repetidos: "sii" → "si", "daleee" → "dale"
+    collapsed_tokens = {re.sub(r"(.)\1+", r"\1", t) for t in tokens}
+    if collapsed_tokens and collapsed_tokens.issubset(_VER_MAS_AFFIRMATIVES):
+        return Classification(intent="ver_mas")
 
     # ── Provincia (respuesta de ubicación pura) ───────────────────────
     # Si el mensaje es SOLO una provincia/ciudad (sin intención de beneficio),

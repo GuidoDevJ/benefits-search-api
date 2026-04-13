@@ -10,24 +10,16 @@ Interfaz de chat async con Gradio para el sistema de búsqueda de beneficios.
 - Soporte de número de WhatsApp para identificación personalizada.
 """
 
-import time
 from typing import List, Optional, Tuple
 from uuid import uuid4
 
 import gradio as gr
-from langchain_core.messages import HumanMessage
 
 from ..config import (
     AUDIT_ENABLED,
     BEDROCK_MODEL_ID,
-    MEMORY_ENABLED,
     MOCK_USER_PROFILE,
-    USER_IDENTIFICATION_ENABLED,
 )
-from ..graph import get_graph
-from ..tools.nlp_processor import is_valid_query
-from ..tools.llm_classifier import classify_query
-from ..tools.fast_classifier import fast_classify
 from ..tools.push_notifications import send_push_notification
 from ..tools.cloudwatch_unhandled_queries import get_cw_service
 
@@ -54,7 +46,7 @@ def _get_top_from_prefs(user_prefs: dict) -> tuple:
     """
     Lee contadores de uso y retorna (top_categoria, top_dias).
 
-    Umbral: ≥ 2 usos para considerar preferencia estable.
+    Umbral: >= 2 usos para considerar preferencia estable.
     """
     cat_counts = user_prefs.get("cat_counts", {})
     top_cat = None
@@ -66,6 +58,40 @@ def _get_top_from_prefs(user_prefs: dict) -> tuple:
     day_counts = user_prefs.get("day_counts", {})
     top_dias = [d for d, c in day_counts.items() if c >= 2] or None
     return top_cat, top_dias
+
+
+# Mapeo weekday() → clave de día normalizada
+_WEEKDAY_KEY = [
+    "lunes", "martes", "miercoles", "jueves",
+    "viernes", "sabado", "domingo",
+]
+
+
+def _autofill_today(
+    merged_clf: dict,
+    user_prefs: dict,
+) -> dict:
+    """
+    Si el usuario no especificó día y hoy coincide con uno de sus días
+    habituales (day_counts >= 2), lo inyecta automáticamente.
+
+    Ej: hoy es sábado, el usuario suele buscar sábados
+    → merged_clf["dias"] = ["sabado"]
+    """
+    if merged_clf.get("dias") or merged_clf.get("dia"):
+        return merged_clf   # ya tiene día, no tocar
+
+    from datetime import datetime
+    hoy_key = _WEEKDAY_KEY[datetime.now().weekday()]
+
+    day_counts = user_prefs.get("day_counts", {})
+    if day_counts.get(hoy_key, 0) >= 2:
+        merged_clf = dict(merged_clf)
+        merged_clf["dias"] = [hoy_key]
+        merged_clf["dia"] = hoy_key
+        print(f"[Prefs] Auto-fill dia={hoy_key} (habitual del usuario)")
+
+    return merged_clf
 
 
 def _needs_clarification(
@@ -169,335 +195,41 @@ async def chat_function(
         return "Por favor, escribe una consulta válida.", "", ""
 
     session_id = str(uuid4())
-    t_start = time.monotonic()
-    audit_service = None
     phone = (phone_number or "").strip() or None
+    audit_service = None
 
     if AUDIT_ENABLED:
         from ..audit.audit_service import get_audit_service
         audit_service = await get_audit_service()
 
     try:
-        # ── 1. Validación rápida con spaCy ─────────────────────────────
-        if not is_valid_query(message):
-            resp = (
-                "No pude entender tu consulta. "
-                "Podés preguntarme sobre:\n"
-                "• Descuentos y beneficios: gastronomía, supermercados, "
-                "entretenimiento, etc."
-            )
-            if audit_service:
-                await audit_service.record_user_input(
-                    session_id=session_id,
-                    model_id=BEDROCK_MODEL_ID,
-                    query=message,
-                    nlp_result={"intent": "invalid", "entities": {}},
-                )
-                total_ms = int((time.monotonic() - t_start) * 1000)
-                await audit_service.record_final_response(
-                    session_id=session_id,
-                    model_id=BEDROCK_MODEL_ID,
-                    response=resp,
-                    total_latency_ms=total_ms,
-                )
-            return resp, session_id, ""
-
-        # ── 2. Clasificación ───────────────────────────────────────────
-        classification = fast_classify(message)
-        if classification is None:
-            classification = await classify_query(message)
-        classification_dict = classification.model_dump()
-
-        if audit_service:
-            await audit_service.record_user_input(
-                session_id=session_id,
-                model_id=BEDROCK_MODEL_ID,
-                query=message,
-                nlp_result=classification_dict,
-            )
-
-        # ── 3. Cargar prefs del usuario (ciudad persistida) ────────────
-        user_prefs: dict = {}
-        if phone:
+        async def on_unknown(q: str) -> None:
             try:
-                from ..memory import get_prefs_service
-                prefs_svc = await get_prefs_service()
-                user_prefs = await prefs_svc.load(phone)
-            except Exception as e:
-                print(f"[Chat] Error cargando prefs: {e}")
-
-        # ── 4. intent="location" → guardar ciudad y confirmar ──────────
-        if classification.intent == "location" and classification.provincia:
-            from ..models.queries_types import PROVINCES
-            pkey = classification.provincia
-            display = PROVINCES.get(pkey, pkey.title())
-            if phone:
-                try:
-                    from ..memory import get_prefs_service
-                    prefs_svc = await get_prefs_service()
-                    await prefs_svc.set_location(phone, pkey, display)
-                    user_prefs["ciudad"] = pkey
-                    user_prefs["ciudad_display"] = display
-                except Exception as e:
-                    print(f"[Chat] Error guardando ubicación: {e}")
-            resp = (
-                f"Perfecto, registre tu zona: **{display}**. "
-                "Ahora tus consultas incluiran beneficios disponibles "
-                "en tu zona. "
-                "Que tipo de beneficios estas buscando?"
-            )
-            if audit_service:
-                total_ms = int((time.monotonic() - t_start) * 1000)
-                await audit_service.record_final_response(
-                    session_id=session_id,
-                    model_id=BEDROCK_MODEL_ID,
-                    response=resp,
-                    total_latency_ms=total_ms,
-                )
-            user_info = _build_user_info_text(None, user_prefs)
-            return resp, session_id, user_info
-
-        # ── 5. Rechazar intents desconocidos ───────────────────────────
-        if classification.intent == "unknown":
-            try:
-                s3_service = await get_cw_service()
-                await s3_service.save_unhandled_query(
-                    query=message,
+                cw = await get_cw_service()
+                await cw.save_unhandled_query(
+                    query=q,
                     detected_intent="unknown",
                     entities={},
                     reason="unknown_intent",
                 )
-            except Exception as s3_err:
-                print(f"[CW] Error guardando query: {s3_err}")
+            except Exception as exc:
+                print(f"[CW] Error guardando query: {exc}")
             try:
-                await send_push_notification(
-                    f"Query no identificada: {message}"
-                )
-            except Exception as push_err:
-                print(f"[Push] Error: {push_err}")
+                await send_push_notification(f"Query no identificada: {q}")
+            except Exception as exc:
+                print(f"[Push] Error: {exc}")
 
-            resp = (
-                "No puedo ayudarte con eso. "
-                "Podés preguntarme sobre:\n"
-                "• Descuentos y beneficios: gastronomía, supermercados, "
-                "entretenimiento, etc."
-            )
-            if audit_service:
-                total_ms = int((time.monotonic() - t_start) * 1000)
-                await audit_service.record_final_response(
-                    session_id=session_id,
-                    model_id=BEDROCK_MODEL_ID,
-                    response=resp,
-                    total_latency_ms=total_ms,
-                )
-            return resp, session_id, ""
-
-        # ── 6. Si la query incluye provincia, persistirla ──────────────────
-        if (
-            phone
-            and classification.provincia
-            and not user_prefs.get("ciudad")
-        ):
-            from ..models.queries_types import PROVINCES
-            pkey = classification.provincia
-            display = PROVINCES.get(pkey, pkey.title())
-            try:
-                from ..memory import get_prefs_service
-                prefs_svc = await get_prefs_service()
-                await prefs_svc.set_location(phone, pkey, display)
-                user_prefs["ciudad"] = pkey
-                user_prefs["ciudad_display"] = display
-            except Exception as e:
-                print(f"[Chat] Error guardando ubicación inline: {e}")
-
-        # ── 7. Cargar historial de conversación ────────────────────────────
-        mem_history = []
-        if phone and MEMORY_ENABLED:
-            try:
-                from ..memory import get_memory_service
-                memory_svc = await get_memory_service()
-                mem_history = await memory_svc.load_history(phone)
-            except Exception as e:
-                print(f"[Chat] Error cargando memoria: {e}")
-
-        is_new_session = len(history) == 0
-
-        # ── 8. Marcar "ya se preguntó la ubicación" si aplica ──────────────
-        if phone and not user_prefs.get("ciudad"):
-            try:
-                from ..memory import get_prefs_service
-                prefs_svc = await get_prefs_service()
-                await prefs_svc.update(phone, location_asked=True)
-                user_prefs["location_asked"] = True
-            except Exception:
-                pass
-
-        # ── 9. Identificar usuario ─────────────────────────────────────────
-        user_profile_dict: Optional[dict] = None
-        if phone and USER_IDENTIFICATION_ENABLED:
-            try:
-                from ..tools.user_profile import fetch_user_profile
-                profile = await fetch_user_profile(phone)
-                user_profile_dict = profile.model_dump()
-                if profile.identificado:
-                    nombre = (
-                        profile.nombre_completo or profile.nombre or ""
-                    )
-                    print(
-                        f"[Chat] session={session_id[:8]} "
-                        f"usuario={nombre} ({profile.segmento})"
-                    )
-            except Exception as e:
-                print(f"[Chat] Error identificando usuario: {e}")
-
-        # ── 10. Gathering / ver_mas / búsqueda ────────────────────────────
-        search_context: dict = {}
-        prefs_svc_ref = None
-        if phone:
-            try:
-                from ..memory import get_prefs_service
-                prefs_svc_ref = await get_prefs_service()
-                search_context = await prefs_svc_ref.load_search_context(
-                    phone
-                )
-            except Exception:
-                pass
-
-        # ── 10b. intent="ver_mas" → página siguiente de la última búsqueda
-        if classification.intent == "ver_mas":
-            if search_context and not search_context.get("gathering"):
-                page = search_context.get("page", 1) + 1
-                merged_clf = {
-                    k: v for k, v in search_context.items()
-                    if k not in ("gathering", "page")
-                }
-                merged_clf["intent"] = "benefits"
-                merged_clf["page"] = page
-                if prefs_svc_ref and phone:
-                    try:
-                        await prefs_svc_ref.save_search_context(
-                            phone, merged_clf, gathering=False
-                        )
-                    except Exception:
-                        pass
-                graph_context = {
-                    "classification": merged_clf,
-                    "offset": (page - 1) * 5,
-                }
-            else:
-                resp = (
-                    "No tengo una búsqueda anterior para continuar. "
-                    "¿Qué tipo de beneficio buscás?"
-                )
-                if audit_service:
-                    total_ms = int((time.monotonic() - t_start) * 1000)
-                    await audit_service.record_final_response(
-                        session_id=session_id,
-                        model_id=BEDROCK_MODEL_ID,
-                        response=resp,
-                        total_latency_ms=total_ms,
-                    )
-                return resp, session_id, _build_user_info_text(
-                    user_profile_dict, user_prefs
-                )
-        else:
-            # ── Flujo normal: gathering + clarification ────────────────────
-            gathering = (
-                search_context if search_context.get("gathering") else {}
-            )
-            merged_clf = _merge_context(gathering, classification_dict)
-
-            needs_more, clarification_q = _needs_clarification(
-                classification_dict, gathering, user_prefs
-            )
-            if needs_more:
-                if prefs_svc_ref and phone:
-                    try:
-                        await prefs_svc_ref.save_search_context(
-                            phone, merged_clf, gathering=True
-                        )
-                    except Exception:
-                        pass
-                if audit_service:
-                    total_ms = int((time.monotonic() - t_start) * 1000)
-                    await audit_service.record_final_response(
-                        session_id=session_id,
-                        model_id=BEDROCK_MODEL_ID,
-                        response=clarification_q,
-                        total_latency_ms=total_ms,
-                    )
-                user_info = _build_user_info_text(None, user_prefs)
-                return clarification_q, session_id, user_info
-
-            # Inyectar preferencias guardadas si faltan en merged_clf
-            top_cat, top_dias = _get_top_from_prefs(user_prefs)
-            if top_cat and not merged_clf.get("categoria_benefits"):
-                merged_clf["categoria_benefits"] = top_cat
-            if top_dias and not merged_clf.get("dias"):
-                merged_clf["dias"] = top_dias
-                if len(top_dias) == 1:
-                    merged_clf["dia"] = top_dias[0]
-
-            # Guardar como last_search (gathering=False, page=1)
-            merged_clf["page"] = 1
-            if prefs_svc_ref and phone:
-                try:
-                    await prefs_svc_ref.save_search_context(
-                        phone, merged_clf, gathering=False
-                    )
-                except Exception:
-                    pass
-
-            graph_context = {"classification": merged_clf}
-
-        # ── 11. Invocar grafo con contexto completo ────────────────────────
-        messages = mem_history + [HumanMessage(content=message)]
-        result = await get_graph().ainvoke({
-            "messages": messages,
-            "next": "",
-            "context": graph_context,
-            "session_id": session_id,
-            "audit_service": audit_service,
-            "phone_number": phone,
-            "user_profile": user_profile_dict,
-            "user_prefs": user_prefs,
-            "is_new_session": is_new_session,
-        })
-        response_content = _extract_response(result)
-
-        # ── 12. Actualizar contadores de preferencias ─────────────────
-        if phone and prefs_svc_ref and classification.intent != "ver_mas":
-            try:
-                cat = merged_clf.get("categoria_benefits")
-                dias = merged_clf.get("dias")
-                await prefs_svc_ref.update_search_prefs(phone, cat, dias)
-            except Exception as e:
-                print(f"[Chat] Error actualizando prefs: {e}")
-
-        # ── 13. Guardar nueva interacción en memoria ───────────────────
-        if phone and MEMORY_ENABLED:
-            try:
-                from ..memory import get_memory_service
-                memory_svc = await get_memory_service()
-                new_ai_msg = result["messages"][-1]
-                await memory_svc.save_messages(
-                    phone,
-                    [HumanMessage(content=message), new_ai_msg],
-                )
-            except Exception as e:
-                print(f"[Chat] Error guardando memoria: {e}")
-
-        if audit_service:
-            total_ms = int((time.monotonic() - t_start) * 1000)
-            await audit_service.record_final_response(
-                session_id=session_id,
-                model_id=BEDROCK_MODEL_ID,
-                response=response_content,
-                total_latency_ms=total_ms,
-            )
-
-        user_info = _build_user_info_text(user_profile_dict, user_prefs)
-        return response_content, session_id, user_info
+        from ..services.query_orchestrator import get_orchestrator
+        result = await get_orchestrator().handle(
+            query=message,
+            phone=phone,
+            session_id=session_id,
+            audit_service=audit_service,
+            log_prefix="[Chat]",
+            on_unknown_query=on_unknown,
+        )
+        user_info = _build_user_info_text(result.user_profile, result.user_prefs)
+        return result.response, result.session_id, user_info
 
     except Exception as exc:
         error_msg = f"Ocurrió un error al procesar tu consulta: {exc}"
