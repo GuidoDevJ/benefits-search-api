@@ -71,13 +71,12 @@ def _build_user_context_block(
     ]
 
     # ── Perfil del cliente ────────────────────────────────────────────
+    # El nombre NO se inyecta en el contexto: el saludo inicial ya fue
+    # manejado por Python (prepend determinístico). Si el LLM viera el
+    # nombre aquí lo usaría como apertura en cada turno, repitiendo el
+    # saludo. El segmento y productos sí se incluyen para personalizar
+    # el tono y el filtrado de productos.
     if user_profile.get("identificado"):
-        nombre = (
-            user_profile.get("nombre_completo")
-            or user_profile.get("nombre")
-        )
-        if nombre and is_new_session:
-            lines.append(f"- Nombre del cliente: {nombre}")
         if user_profile.get("segmento"):
             seg = user_profile["segmento"]
             lines.append(f"- Segmento: {seg}")
@@ -159,12 +158,7 @@ def _build_user_context_block(
                 "Preguntalo una única vez."
             )
 
-    header = "Contexto del cliente:\n" + "\n".join(lines)
-
-    if user_profile.get("identificado") and is_new_session:
-        header += "\n\nDestacá los beneficios exclusivos de su segmento."
-
-    return header
+    return "Contexto del cliente:\n" + "\n".join(lines)
 
 
 def _validate_tool_result(tool_result: dict) -> dict:

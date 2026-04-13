@@ -335,20 +335,30 @@ class TestBuildUserContextBlock:
         # Más de 2hs → no mostrar recencia
         assert "hace" not in ctx.lower() or "supermercados" not in ctx
 
-    def test_saludo_solo_en_nueva_sesion(self):
+    def test_nombre_nunca_en_contexto(self):
+        """
+        El nombre del cliente NUNCA va en el contexto del LLM.
+        El saludo con nombre es responsabilidad exclusiva del prepend
+        determinístico en Python (benefits_agent_node).
+        Si el LLM viera el nombre lo usaría como apertura en cada turno,
+        repitiendo el saludo ("¡Excelente, Roberto!").
+        """
         from src.agents.benefits_agent import _build_user_context_block
 
         prefs = {"cat_counts": {}, "day_counts": {}}
-        # Nueva sesión → incluye nombre
+
+        # Ni en nueva sesión...
         ctx_new = _build_user_context_block(
             self._profile(), prefs, is_new_session=True
         )
-        assert "Martin" in ctx_new
+        assert "Martin" not in ctx_new
+        assert "Nombre del cliente" not in ctx_new
 
-        # Sesión existente → no incluye nombre
+        # ...ni en sesión existente.
         ctx_old = _build_user_context_block(
             self._profile(), prefs, is_new_session=False
         )
+        assert "Martin" not in ctx_old
         assert "Nombre del cliente" not in ctx_old
 
     def test_dias_habituales_aparecen_en_contexto(self):
@@ -428,7 +438,11 @@ class TestEndToEndMemoryFlow:
         )
         assert "favorita" not in ctx
         assert "Hace" not in ctx
-        assert "Carlos" in ctx  # saludo solo en primera sesión
+        # El nombre no va en el contexto — lo maneja el prepend de Python
+        assert "Carlos" not in ctx
+        # Pero el segmento y productos sí deben estar
+        assert "BLACK" in ctx
+        assert "MASTERCARD" in ctx
 
     def test_autofill_integrado_con_prefs(self):
         """

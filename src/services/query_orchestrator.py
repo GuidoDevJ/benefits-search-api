@@ -25,7 +25,9 @@ Pipeline:
   14. Guardar nueva interacción en memoria
 """
 
+import re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 from uuid import uuid4
@@ -58,6 +60,47 @@ except ImportError:
         _merge_context,
         _needs_clarification,
     )
+
+
+# ── Recuperación de contexto desde historial ─────────────────────────────
+
+def _recover_classification_from_history(history: list) -> Optional[dict]:
+    """
+    Escanea el historial en orden inverso buscando el último HumanMessage
+    que disparó una búsqueda de benefits.
+
+    Se usa como fallback cuando search_context no está disponible:
+    expiró (TTL), primer mensaje de la sesión en WhatsApp, o Redis falló.
+
+    Returns:
+        dict compatible con Classification.model_dump() (intent=benefits),
+        o None si no hay nada recuperable.
+    """
+    try:
+        from ..tools.fast_classifier import fast_classify, _VER_MAS_AFFIRMATIVES
+    except ImportError:
+        from src.tools.fast_classifier import fast_classify, _VER_MAS_AFFIRMATIVES
+
+    def _norm(text: str) -> str:
+        text = text.lower().strip()
+        text = unicodedata.normalize("NFD", text)
+        text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+        text = re.sub(r"[^\w\s]", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    for msg in reversed(history):
+        if not isinstance(msg, HumanMessage):
+            continue
+        normalized = _norm(msg.content)
+        tokens = set(normalized.split())
+        # Saltar afirmativos cortos y mensajes vacíos
+        if not tokens or tokens.issubset(_VER_MAS_AFFIRMATIVES) or len(normalized) <= 2:
+            continue
+        clf = fast_classify(msg.content)
+        if clf and clf.intent == "benefits":
+            return clf.model_dump()
+
+    return None
 
 
 # ── Resultado del orquestador ─────────────────────────────────────────────
@@ -324,6 +367,7 @@ class QueryOrchestrator:
 
         if classification.intent == "ver_mas":
             if search_context and not search_context.get("gathering"):
+                # ── Caso normal: search_context fresco en Redis ───────────
                 page = search_context.get("page", 1) + 1
                 merged_clf = {
                     k: v for k, v in search_context.items()
@@ -343,26 +387,50 @@ class QueryOrchestrator:
                     "offset": (page - 1) * 5,
                 }
             else:
-                resp = (
-                    "No tengo una búsqueda anterior para continuar. "
-                    "¿Qué tipo de beneficio buscás?"
-                )
-                total_ms = int((time.monotonic() - t_start) * 1000)
-                if audit_service:
-                    await audit_service.record_final_response(
-                        session_id=session_id,
-                        model_id=BEDROCK_MODEL_ID,
-                        response=resp,
-                        total_latency_ms=total_ms,
+                # ── Fallback: search_context ausente o expirado ───────────
+                # Escanear el historial en orden inverso para recuperar la
+                # última clasificación válida y continuar desde página 2.
+                # Esto permite que "sí" / "dale" funcionen aunque Redis haya
+                # expirado el search_context o sea una sesión nueva.
+                recovered_clf = _recover_classification_from_history(history)
+                if recovered_clf:
+                    print(
+                        f"{log_prefix} ver_mas sin search_context — "
+                        f"recuperado del historial: "
+                        f"cat={recovered_clf.get('categoria_benefits')} "
+                        f"dias={recovered_clf.get('dias')}"
                     )
-                return OrchestratorResult(
-                    response=resp,
-                    session_id=session_id,
-                    user_profile=user_profile_dict,
-                    user_prefs=user_prefs,
-                    is_early_exit=True,
-                    total_ms=total_ms,
-                )
+                    recovered_clf["intent"] = "benefits"
+                    recovered_clf["page"] = 2
+                    merged_clf = recovered_clf
+                    graph_context = {
+                        "classification": merged_clf,
+                        "offset": 5,
+                    }
+                else:
+                    # Sin historial recuperable: respuesta conversacional
+                    # (primera interacción o historial solo afirmativos)
+                    resp = (
+                        "¿Qué tipo de beneficios querés ver? "
+                        "Podés pedirme gastronomía, supermercados, "
+                        "combustible, moda, cine, y muchas categorías más."
+                    )
+                    total_ms = int((time.monotonic() - t_start) * 1000)
+                    if audit_service:
+                        await audit_service.record_final_response(
+                            session_id=session_id,
+                            model_id=BEDROCK_MODEL_ID,
+                            response=resp,
+                            total_latency_ms=total_ms,
+                        )
+                    return OrchestratorResult(
+                        response=resp,
+                        session_id=session_id,
+                        user_profile=user_profile_dict,
+                        user_prefs=user_prefs,
+                        is_early_exit=True,
+                        total_ms=total_ms,
+                    )
         else:
             gathering = (
                 search_context if search_context.get("gathering") else {}

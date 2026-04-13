@@ -392,7 +392,8 @@ class TestFastClassifyBeforeNLP:
 
         result = fast_classify(affirmative)
         assert result is not None, (
-            f"fast_classify({affirmative!r}) retornó None — debería reconocerlo"
+            f"fast_classify({affirmative!r}) retornó None "
+            f"— debería reconocerlo"
         )
         assert result.intent == "ver_mas", (
             f"fast_classify({affirmative!r}).intent={result.intent!r}, "
@@ -457,7 +458,9 @@ class TestFastClassifyBeforeNLP:
 
         # fast_classify lo reconoce → válido sin necesitar NLP
         fc_result = fast_classify(query)
-        assert fc_result is not None, "fast_classify('si') no debe retornar None"
+        assert fc_result is not None, (
+            "fast_classify('si') no debe retornar None"
+        )
         assert fc_result.intent == "ver_mas"
 
         # NLP sola lo rechazaría
@@ -465,6 +468,126 @@ class TestFastClassifyBeforeNLP:
             "is_valid_query('si') debe ser False — confirma que el orden "
             "fast_classify-first es necesario para no bloquear afirmativos"
         )
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 5. Recuperación de clasificación desde historial (fallback ver_mas)
+# ════════════════════════════════════════════════════════════════════════
+
+class TestRecoverClassificationFromHistory:
+    """
+    _recover_classification_from_history escanea el historial en orden
+    inverso y devuelve la última clasificación benefits válida.
+
+    Cubre el caso donde search_context expiró en Redis y el usuario
+    dice "sí" — el orquestador recupera los parámetros del historial
+    en lugar de responder "No tengo búsqueda anterior".
+    """
+
+    def _human(self, text: str):
+        from langchain_core.messages import HumanMessage
+        return HumanMessage(content=text)
+
+    def _ai(self, text: str):
+        from langchain_core.messages import AIMessage
+        return AIMessage(content=text)
+
+    def test_recovers_benefits_query_from_history(self):
+        """La última query de benefits en el historial se recupera."""
+        from src.services.query_orchestrator import (
+            _recover_classification_from_history,
+        )
+
+        history = [
+            self._human("busco descuentos en gastronomía"),
+            self._ai("Encontré 12 beneficios..."),
+            self._human("sí"),
+        ]
+
+        result = _recover_classification_from_history(history)
+
+        assert result is not None
+        assert result["intent"] == "benefits"
+        assert result["categoria_benefits"] == "gastronomia"
+
+    def test_skips_affirmatives_in_history(self):
+        """Los afirmativos intermedios se saltan; se usa la query real."""
+        from src.services.query_orchestrator import (
+            _recover_classification_from_history,
+        )
+
+        history = [
+            self._human("quiero ver cine los viernes"),
+            self._ai("Encontré 8 beneficios..."),
+            self._human("dale"),
+            self._ai("Acá van los siguientes 5..."),
+            self._human("sí"),
+        ]
+
+        result = _recover_classification_from_history(history)
+
+        assert result is not None
+        assert result["categoria_benefits"] == "cine"
+
+    def test_returns_none_on_empty_history(self):
+        """Sin historial retorna None sin explotar."""
+        from src.services.query_orchestrator import (
+            _recover_classification_from_history,
+        )
+
+        assert _recover_classification_from_history([]) is None
+
+    def test_returns_none_when_only_affirmatives(self):
+        """Si el historial solo tiene afirmativos, retorna None."""
+        from src.services.query_orchestrator import (
+            _recover_classification_from_history,
+        )
+
+        history = [
+            self._human("sí"),
+            self._human("dale"),
+            self._human("ok"),
+        ]
+
+        assert _recover_classification_from_history(history) is None
+
+    def test_uses_most_recent_query(self):
+        """
+        Si hay dos búsquedas distintas en el historial,
+        se recupera la más reciente.
+        """
+        from src.services.query_orchestrator import (
+            _recover_classification_from_history,
+        )
+
+        history = [
+            self._human("descuentos en supermercados"),
+            self._ai("Encontré 5 beneficios en supermercados..."),
+            self._human("ahora busco combustible"),
+            self._ai("Encontré 3 beneficios de combustible..."),
+            self._human("sí"),
+        ]
+
+        result = _recover_classification_from_history(history)
+
+        assert result is not None
+        assert result["categoria_benefits"] == "combustible"
+
+    def test_ignores_ai_messages(self):
+        """Los AIMessages se ignoran — solo se escanean HumanMessages."""
+        from src.services.query_orchestrator import (
+            _recover_classification_from_history,
+        )
+
+        history = [
+            self._human("gastronomía los sábados"),
+            self._ai("dale viernes → gastronomia sabado descuento"),
+        ]
+
+        result = _recover_classification_from_history(history)
+
+        assert result is not None
+        assert result["categoria_benefits"] == "gastronomia"
 
 
 class TestSearchResultsCache:
