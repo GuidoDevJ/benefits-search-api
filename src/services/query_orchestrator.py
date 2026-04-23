@@ -41,7 +41,7 @@ try:
         USER_IDENTIFICATION_ENABLED,
     )
     from ..graph import get_graph
-    from ..ui.chat_interface import (
+    from .context_utils import (
         _autofill_today,
         _get_top_from_prefs,
         _merge_context,
@@ -54,12 +54,21 @@ except ImportError:
         USER_IDENTIFICATION_ENABLED,
     )
     from src.graph import get_graph
-    from src.ui.chat_interface import (
+    from src.services.context_utils import (
         _autofill_today,
         _get_top_from_prefs,
         _merge_context,
         _needs_clarification,
     )
+
+
+def _normalize_text(text: str) -> str:
+    """Normaliza texto: minúsculas, sin acentos, sin puntuación extra."""
+    text = text.lower().strip()
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 # ── Recuperación de contexto desde historial ─────────────────────────────
@@ -77,24 +86,24 @@ def _recover_classification_from_history(history: list) -> Optional[dict]:
         o None si no hay nada recuperable.
     """
     try:
-        from ..tools.fast_classifier import fast_classify, _VER_MAS_AFFIRMATIVES
+        from ..tools.fast_classifier import (
+            fast_classify, _VER_MAS_AFFIRMATIVES,
+        )
     except ImportError:
-        from src.tools.fast_classifier import fast_classify, _VER_MAS_AFFIRMATIVES
-
-    def _norm(text: str) -> str:
-        text = text.lower().strip()
-        text = unicodedata.normalize("NFD", text)
-        text = "".join(c for c in text if unicodedata.category(c) != "Mn")
-        text = re.sub(r"[^\w\s]", " ", text)
-        return re.sub(r"\s+", " ", text).strip()
+        from src.tools.fast_classifier import (
+            fast_classify, _VER_MAS_AFFIRMATIVES,
+        )
 
     for msg in reversed(history):
         if not isinstance(msg, HumanMessage):
             continue
-        normalized = _norm(msg.content)
+        normalized = _normalize_text(msg.content)
         tokens = set(normalized.split())
-        # Saltar afirmativos cortos y mensajes vacíos
-        if not tokens or tokens.issubset(_VER_MAS_AFFIRMATIVES) or len(normalized) <= 2:
+        if (
+            not tokens
+            or tokens.issubset(_VER_MAS_AFFIRMATIVES)
+            or len(normalized) <= 2
+        ):
             continue
         clf = fast_classify(msg.content)
         if clf and clf.intent == "benefits":
@@ -116,7 +125,7 @@ class OrchestratorResult:
         user_profile:   Perfil identificado o None.
         user_prefs:     Preferencias del usuario (ciudad, contadores, etc.).
         is_early_exit:  True si el pipeline salió antes de invocar el grafo
-                        (location, unknown, ver_mas sin contexto, clarification).
+                        (location, unknown, ver_mas sin contexto).
         total_ms:       Latencia total en milisegundos.
     """
     response: str

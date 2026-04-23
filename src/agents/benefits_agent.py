@@ -18,13 +18,11 @@ Orden fijo del system prompt:
 """
 
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from langchain_aws import ChatBedrock
-from langchain_core.messages import (
-    AIMessage, BaseMessage, HumanMessage, SystemMessage
-)
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 
 from src.audit.models import TokenUsage
 from src.audit.prompt_registry import get_prompt_registry
@@ -38,6 +36,12 @@ except ImportError:
     from src.agents.base_agent import AgentState, messages_to_dict
     from src.tools.benefits_api import search_benefits_with_profile
     from src.models.typed_entities import Entities
+
+
+_DIAS_ES = [
+    "lunes", "martes", "miércoles", "jueves",
+    "viernes", "sábado", "domingo",
+]
 
 
 def _extract_token_usage(response) -> Optional[TokenUsage]:
@@ -62,14 +66,9 @@ def _build_user_context_block(
     - Ciudad/provincia: siempre si está guardada en prefs.
     - Solicitar ubicación: al final, si no hay ciudad y no se preguntó aún.
     """
-    _DIAS_ES = [
-        "lunes", "martes", "miércoles", "jueves",
-        "viernes", "sábado", "domingo",
-    ]
     hoy = datetime.now()
     lines: list[str] = [
-        f"- Fecha actual: {_DIAS_ES[hoy.weekday()]} "
-        f"{hoy.strftime('%d/%m/%Y')}",
+        f"- Fecha actual: {_DIAS_ES[hoy.weekday()]} {hoy.strftime('%d/%m/%Y')}",
     ]
 
     # ── Perfil del cliente ────────────────────────────────────────────
@@ -126,11 +125,9 @@ def _build_user_context_block(
     last_at = user_prefs.get("last_searched_at")
     if last_cat and last_at and not is_new_session:
         try:
-            from datetime import timezone
-            from datetime import datetime as dt
-            last_dt = dt.fromisoformat(last_at)
+            last_dt = datetime.fromisoformat(last_at)
             mins_ago = int(
-                (dt.now(timezone.utc) - last_dt).total_seconds() / 60
+                (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
             )
             if mins_ago < 120:
                 lines.append(

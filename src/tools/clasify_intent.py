@@ -153,16 +153,3 @@ def build_filter_params(
         params["benefit_type"] = entity.tipo_beneficio
 
     return params
-
-
-# ── Backward compatibility ────────────────────────────────────────────────
-# get_filter() se mantiene para no romper imports existentes.
-# Delega a build_filter_params con la API anterior (Entities sin dias).
-
-def get_filter(entity: Entities) -> dict:
-    """
-    [Deprecated] Usar build_filter_params() para lógica completa.
-
-    Wrapper de compatibilidad para código existente que llame get_filter().
-    """
-    return build_filter_params(entity, user_profile=None)

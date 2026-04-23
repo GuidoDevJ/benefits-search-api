@@ -17,6 +17,7 @@ Pipeline de filtrado (todo Python, sin LLM):
 import asyncio
 import hashlib
 import json
+import re
 import unicodedata
 from typing import Dict, List, Optional
 
@@ -138,8 +139,8 @@ class BenefitsResponse(BaseModel):
 
 # ── Caché ────────────────────────────────────────────────────────────────
 
-CACHE_TTL_ALL_BENEFITS = 86400   # 24 horas  — beneficios crudos de la API
-CACHE_TTL_SEARCH_RESULTS = 3600  #  1 hora   — resultados filtrados/ordenados
+CACHE_TTL_ALL_BENEFITS = 86400   # 24 h — beneficios crudos de la API
+CACHE_TTL_SEARCH_RESULTS = 3600  #  1 h — resultados filtrados/ordenados
 
 
 def _build_search_cache_key(
@@ -187,7 +188,12 @@ async def _fetch_all_benefits_from_api(
         return data
 
     if state_id is not None:
-        params = {"pagesize": config.default_pagesize, "allfields": "", "state": state_id, "city": 0}
+        params = {
+            "pagesize": config.default_pagesize,
+            "allfields": "",
+            "state": state_id,
+            "city": 0,
+        }
     else:
         params = {"pagesize": config.default_pagesize, "allFields": ""}
     try:
@@ -213,7 +219,9 @@ async def _get_cached_for_state(
 ) -> Optional[List[dict]]:
     """Obtiene (o cachea) los beneficios para un único state_id (o global)."""
     if not CACHE_ENABLED:
-        return await _fetch_all_benefits_from_api(config, headers, timeout, state_id)
+        return await _fetch_all_benefits_from_api(
+            config, headers, timeout, state_id
+        )
 
     try:
         cache = await get_cache_service()
@@ -223,7 +231,9 @@ async def _get_cached_for_state(
             return cached_data
 
         print(f"[Cache] MISS: {cache_key} — llamando API...")
-        data = await _fetch_all_benefits_from_api(config, headers, timeout, state_id)
+        data = await _fetch_all_benefits_from_api(
+            config, headers, timeout, state_id
+        )
 
         if data:
             await cache.set(cache_key, data, ttl=CACHE_TTL_ALL_BENEFITS)
@@ -232,7 +242,9 @@ async def _get_cached_for_state(
         return data
     except Exception as e:
         print(f"[Cache] Error: {e}")
-        return await _fetch_all_benefits_from_api(config, headers, timeout, state_id)
+        return await _fetch_all_benefits_from_api(
+            config, headers, timeout, state_id
+        )
 
 
 async def _get_all_benefits_cached(
@@ -256,7 +268,9 @@ async def _get_all_benefits_cached(
 
     if len(state_ids) == 1:
         key = f"all_benefits:state:{state_ids[0]}"
-        return await _get_cached_for_state(key, state_ids[0], config, headers, timeout)
+        return await _get_cached_for_state(
+            key, state_ids[0], config, headers, timeout
+        )
 
     # Múltiples zonas: fetch en paralelo, luego deduplicar por ID de beneficio
     tasks = [
@@ -277,7 +291,10 @@ async def _get_all_benefits_cached(
                     seen.add(bid)
                     merged.append(item)
 
-    print(f"[Cache] Merge {len(state_ids)} zonas -> {len(merged)} beneficios unicos")
+    print(
+        f"[Cache] Merge {len(state_ids)} zonas -> "
+        f"{len(merged)} beneficios unicos"
+    )
     return merged or None
 
 
@@ -382,7 +399,6 @@ def _parse_discount(d_str: str) -> float:
       "3 cuotas s/i"   → 0.0  (sin porcentaje)
       ""               → 0.0
     """
-    import re
     if not d_str:
         return 0.0
     match = re.search(r"(\d+(?:[.,]\d+)?)", str(d_str))
@@ -397,7 +413,11 @@ def _sort_by_discount(data: List[dict]) -> List[dict]:
 
     Preserva el orden relativo entre items con el mismo descuento.
     """
-    return sorted(data, key=lambda item: _parse_discount(item.get("d", "")), reverse=True)
+    return sorted(
+        data,
+        key=lambda item: _parse_discount(item.get("d", "")),
+        reverse=True,
+    )
 
 
 def _prioritize(data: List[dict], params: dict) -> List[dict]:
@@ -483,7 +503,11 @@ async def fetch_benefits(
     provincia = (user_profile or {}).get("provincia")
     state_ids = _resolve_state_ids(provincia)
     if provincia:
-        label = f"{provincia} → state_ids={state_ids}" if state_ids else f"{provincia} → fallback global"
+        label = (
+            f"{provincia} → state_ids={state_ids}"
+            if state_ids
+            else f"{provincia} → fallback global"
+        )
         print(f"[Benefits] {label}")
 
     try:

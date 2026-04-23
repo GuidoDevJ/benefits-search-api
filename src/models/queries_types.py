@@ -15,6 +15,9 @@ Estructura del beneficio en la API:
   b     → nombre del comercio
 """
 
+import re
+import unicodedata
+
 # ── TRADES ───────────────────────────────────────────────────────────────────
 # Clave normalizada (sin acentos, min.) -> lista de IDs en campo r[]
 # Muchas categorias tienen multiples IDs en la API (duplicados historicos).
@@ -354,7 +357,7 @@ def normalize_product_name(raw: str) -> str | None:
     return PRODUCT_NAME_ALIASES.get(raw.strip().lower())
 
 
-# ── PROVINCES ─────────────────────────────────────────────────────────────────
+# ── PROVINCES ────────────────────────────────────────────────────────────────
 # Clave normalizada (sin acentos, minúsculas) → nombre display oficial.
 # 24 provincias argentinas + CABA.
 PROVINCES: dict[str, str] = {
@@ -385,7 +388,7 @@ PROVINCES: dict[str, str] = {
     "tucuman":            "Tucumán",
 }
 
-# Aliases: variantes, ciudades capitales y nombres coloquiales → clave en PROVINCES.
+# Aliases: variantes, ciudades capitales y nombres coloquiales → clave.
 PROVINCE_ALIASES: dict[str, str] = {
     # CABA
     "ciudad autonoma":    "caba",
@@ -437,6 +440,20 @@ PROVINCE_ALIASES: dict[str, str] = {
 }
 
 
+_LOCATION_PREFIXES = (
+    "soy de ", "vivo en ", "estoy en ", "desde ", "de ",
+    "me encuentro en ", "mi ciudad es ", "mi zona es ",
+    "mi provincia es ", "en ",
+)
+
+
+def _norm_province(s: str) -> str:
+    s = s.lower().strip()
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return re.sub(r"\s+", " ", s).strip()
+
+
 def resolve_province(text: str) -> tuple[str, str] | None:
     """
     Intenta resolver un texto a una provincia argentina.
@@ -446,35 +463,21 @@ def resolve_province(text: str) -> tuple[str, str] | None:
     Ej: "soy de córdoba" → ("cordoba", "Córdoba")
          "Corrientes"    → ("corrientes", "Corrientes")
     """
-    import unicodedata
-    import re
+    normalized = _norm_province(text)
 
-    def _norm(s: str) -> str:
-        s = s.lower().strip()
-        s = unicodedata.normalize("NFD", s)
-        s = "".join(c for c in s if unicodedata.category(c) != "Mn")
-        return re.sub(r"\s+", " ", s).strip()
-
-    normalized = _norm(text)
-
-    # Frases que indican que el usuario está dando su ubicación
-    _LOCATION_PREFIXES = [
-        "soy de ", "vivo en ", "estoy en ", "desde ", "de ",
-        "me encuentro en ", "mi ciudad es ", "mi zona es ",
-        "mi provincia es ", "en ",
-    ]
     clean = normalized
     for prefix in _LOCATION_PREFIXES:
         if clean.startswith(prefix):
             clean = clean[len(prefix):].strip()
             break
 
-    # Buscar en aliases primero, luego en PROVINCES directamente
-    key = PROVINCE_ALIASES.get(clean) or (clean if clean in PROVINCES else None)
+    key = (
+        PROVINCE_ALIASES.get(clean)
+        or (clean if clean in PROVINCES else None)
+    )
     if key and key in PROVINCES:
         return (key, PROVINCES[key])
 
-    # Búsqueda parcial (el texto contiene el nombre de provincia)
     for alias, k in PROVINCE_ALIASES.items():
         if alias in normalized and k in PROVINCES:
             return (k, PROVINCES[k])

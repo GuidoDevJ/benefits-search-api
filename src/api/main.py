@@ -64,13 +64,6 @@ app.add_middleware(
 )
 
 
-@app.middleware("http")
-async def add_cors_headers(request, call_next):
-    response = await call_next(request)
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    return response
-
-
 @app.get("/")
 async def read_root():
     return JSONResponse(
