@@ -29,13 +29,15 @@ def normalize_promo(promo: any) -> any:
     Solo incluye campos esenciales para reducir tokens enviados al LLM.
     """
     benefit_type = BENEFIT_TYPE.get(promo["t"])
+    d = promo["d"]
+    q = promo["q"]
 
     if benefit_type == "descuento":
-        beneficio = f'{promo["d"]}%'
+        beneficio = f"{d}% de descuento"
     elif benefit_type == "cuotas":
-        beneficio = f'{promo["q"]}c'
+        beneficio = f"{q} cuotas sin interés"
     else:
-        beneficio = f'{promo["d"]}%+{promo["q"]}c'
+        beneficio = f"{d}% de descuento + {q} cuotas sin interés"
 
     return {
         "nom": promo["b"],

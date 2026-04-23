@@ -1,8 +1,12 @@
 """
-Typed Entities - Modelos Pydantic para entidades.
+Typed Entities — Modelos Pydantic para entidades extraídas del NLP.
 
-Define los modelos de datos que representan las entidades
-extraídas del procesamiento NLP.
+Cambios respecto a la versión anterior:
+- `dia` (str) reemplazado por `dias` (list[str]) para soporte multi-día
+
+  Ej: "fin de semana" → ["sabado", "domingo"]
+- Nuevo campo `segmento`: inyectado desde user_profile, no del texto
+- Nuevo campo `provincia`: extracción geográfica (futuro)
 """
 
 from typing import Optional
@@ -12,28 +16,32 @@ from pydantic import BaseModel
 
 class Entities(BaseModel):
     """
-    Modelo de entidades extraídas del texto.
+    Entidades extraídas del texto del usuario + contexto de user_profile.
 
     Attributes:
-        ciudad: Ciudad mencionada (ej: "corrientes", "9 de julio")
-        tarjeta: Tarjeta de crédito (ej: "visa", "mastercard", "modo")
-        dia: Día de la semana (ej: "lunes", "viernes")
-        categoria: Categoría de comercio (ej: "Gastronomía", "Supermercados")
-        localidad: Localidad/provincia (ej: "corrientes", "buenos aires")
-        negocio: Nombre del negocio/local (ej: "Freddo", "McDonald's")
+        ciudad:    Ciudad mencionada (ej: "corrientes", "9 de julio")
+        tarjeta:   Tarjeta de crédito mencionada (ej: "visa", "mastercard")
+        dias:      Días de la semana, soporta multi-día
+                   (ej: ["sabado", "domingo"], ["lunes"])
+        categoria: Categoría de comercio normalizada
+                   (ej: "gastronomia", "supermercados", "bares")
+        localidad: Localidad/provincia mencionada
+        negocio:   Nombre de comercio específico (ej: "carrefour", "ypf")
+        segmento:  Segmento bancario del usuario, inyectado desde user_profile
+                   (ej: "black", "premium", "plan_sueldo")
+        provincia: Provincia mencionada explícitamente por el usuario
     """
 
-    ciudad: Optional[str] = None
-    tarjeta: Optional[str] = None
-    dia: Optional[str] = None
-    categoria: Optional[str] = None
-    localidad: Optional[str] = None
-    negocio: Optional[str] = None
+    ciudad:         Optional[str] = None
+    tarjeta:        Optional[str] = None
+    dias:           Optional[list[str]] = None
+    categoria:      Optional[str] = None
+    localidad:      Optional[str] = None
+    negocio:        Optional[str] = None
+    segmento:       Optional[str] = None
+    provincia:      Optional[str] = None
+    tipo_beneficio: Optional[str] = None   # "cuotas" | "descuento" | None
 
     class Config:
-        """Configuración de Pydantic."""
-
-        # Permitir validación de campos extra
         extra = "forbid"
-        # Usar valores por defecto
         validate_assignment = True

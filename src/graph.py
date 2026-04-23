@@ -26,11 +26,22 @@ _guardrails = (
     if BEDROCK_GUARDRAIL_ID
     else None
 )
-_llm = ChatBedrock(
+
+# LLM con guardrail: supervisor maneja input crudo del usuario.
+_llm_guarded = ChatBedrock(
     model_id=BEDROCK_MODEL_ID,
     region_name=AWS_REGION,
     **({"guardrails": _guardrails} if _guardrails else {}),
 )
+
+# LLM sin guardrail: benefits solo formatea datos curados de la API interna.
+# El guardrail de prompt-injection bloquea el sistema de inyección de datos
+# estructurados (RESULTADOS DE BÚSQUEDA) que es parte del diseño del agente.
+_llm_benefits = ChatBedrock(
+    model_id=BEDROCK_MODEL_ID,
+    region_name=AWS_REGION,
+)
+
 _graph = None
 
 
@@ -43,8 +54,8 @@ def get_graph():
 
 
 def _build_graph():
-    benefits = create_benefits_agent(_llm)
-    supervisor = create_supervisor_agent(_llm, ["benefits"])
+    benefits = create_benefits_agent(_llm_benefits)
+    supervisor = create_supervisor_agent(_llm_guarded, ["benefits"])
 
     workflow = StateGraph(AgentState)
     workflow.add_node("supervisor", supervisor)

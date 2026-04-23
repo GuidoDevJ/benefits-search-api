@@ -1,24 +1,35 @@
 """
-Benefits API Tool - Herramienta async para consultar beneficios de TeVaBien.
+Benefits API Tool — Consulta y filtrado de beneficios TeVaBien.
 
-Esta herramienta realiza peticiones a la API de TeVaBien con filtros
-extraídos del procesamiento NLP. Incluye caché diario con Redis (24hs).
+Estrategia de caché:
+  - Caché diario (24h): guarda TODOS los beneficios sin filtrar.
+  - Cada request aplica filtros localmente sobre el caché.
+  - Los resultados filtrados NO se cachean (son efímeros por usuario).
+
+Pipeline de filtrado (todo Python, sin LLM):
+  1. trade_ids  → campo r[]  (categoría/rubro)
+  2. days       → campo a    (días válidos como string de dígitos)
+  3. negocio    → campo b    (nombre del comercio, substring)
+  4. product_ids→ campo pr[] (tarjetas habilitadas; pr vacío = todos)
+  5. _prioritize → beneficios del segmento del usuario van primero
 """
 
-# Standard library imports
-from typing import Any, Dict, List, Optional
+import asyncio
+import hashlib
+import json
+import unicodedata
+from typing import Dict, List, Optional
 
-# Third-party imports
 import httpx
 from langchain_core.tools import tool
 from pydantic import BaseModel
 
-# Local imports
 try:
-    from .clasify_intent import get_filter
+    from .clasify_intent import build_filter_params
     from .normalizar import normalize_promo
+    from .benefits_mocks import get_mock_benefits
     from ..cache import get_cache_service
-    from ..config import CACHE_ENABLED
+    from ..config import CACHE_ENABLED, MOCK_BENEFITS
     from ..models.typed_entities import Entities
 except ImportError:
     import sys
@@ -28,184 +39,428 @@ except ImportError:
     if str(_root) not in sys.path:
         sys.path.insert(0, str(_root))
 
-    from src.tools.clasify_intent import get_filter
+    from src.tools.clasify_intent import build_filter_params
     from src.tools.normalizar import normalize_promo
+    from src.tools.benefits_mocks import get_mock_benefits
     from src.cache import get_cache_service
-    from src.config import CACHE_ENABLED
+    from src.config import CACHE_ENABLED, MOCK_BENEFITS
     from src.models.typed_entities import Entities
 
 
+# ── Mapa provincia → state IDs (TeVaBien) ────────────────────────────────
+# Provincias con múltiples IDs (zonas internas) se consultan en paralelo.
+# Si la provincia no figura en el mapa → fallback a consulta global.
+
+PROVINCE_STATE_IDS: Dict[str, List[int]] = {
+    # GBA + interior bonaerense (muchas zonas internas en TeVaBien)
+    "BUENOS AIRES":                      [354, 338, 346, 351, 5, 345,
+                                          337, 352, 355, 344, 319, 310, 353],
+    # CABA: ciudad autónoma — state_id 310 (zona CABA en TeVaBien).
+    # Aliases frecuentes devueltos por sofia-api-users:
+    "CABA":                              [310],
+    "CIUDAD AUTONOMA DE BUENOS AIRES":   [310],
+    "CIUDAD DE BUENOS AIRES":            [310],
+    "CAPITAL FEDERAL":                   [310],
+    "CATAMARCA":                         [64],
+    "CHACO":                             [73],
+    "CHUBUT":                            [107],
+    "CORDOBA":                           [8, 343, 342],
+    "CORRIENTES":                        [70],
+    "ENTRE RIOS":                        [103],
+    "FORMOSA":                           [112],
+    "JUJUY":                             [61],
+    "LA PAMPA":                          [65],
+    "LA RIOJA":                          [316],
+    "MENDOZA":                           [7],
+    "MISIONES":                          [71],
+    "NEUQUEN":                           [72],
+    "RIO NEGRO":                         [63],
+    "SALTA":                             [62],
+    "SAN JUAN":                          [6],
+    "SAN LUIS":                          [26],
+    "SANTA CRUZ":                        [161],
+    "SANTA FE":                          [9],
+    "SANTIAGO DEL ESTERO":               [69],
+    "TIERRA DEL FUEGO":                  [75],
+    "TUCUMAN":                           [10],
+}
+
+
+def _normalize_provincia(name: str) -> str:
+    """Normaliza provincia a mayúsculas sin tildes para lookup en el mapa."""
+    nfkd = unicodedata.normalize("NFKD", name.upper())
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def _resolve_state_ids(provincia: Optional[str]) -> Optional[List[int]]:
+    """
+    Resuelve el/los state ID(s) de TeVaBien para la provincia del usuario.
+    Retorna None si no hay provincia o no está en el mapa (→ fallback global).
+    """
+    if not provincia:
+        return None
+    normalized = _normalize_provincia(provincia)
+    return PROVINCE_STATE_IDS.get(normalized) or None
+
+
+# ── Modelos ──────────────────────────────────────────────────────────────
+
 class BenefitItem(BaseModel):
-    i: int  # id beneficio
-    t: int  # tipo
-    c: List[int]  # categorias
-    d: str  # descuento
-    q: Optional[str]  # query / condición
-    a: str  # código comercio
-    b: str  # nombre comercio
-    ct: str  # canal (MODO)
-    cti: List[int]  # ids canal
-    m: Optional[str]  # media
-    r: List[int]  # regiones
-    o: List[int]  # operaciones
-    f: int  # fecha inicio
-    e: int  # fecha fin
-    pr: List[int]  # productos
+    i:   int              # id beneficio
+    t:   int              # tipo (406=cuotas, 407=descuento, 409=ambos)
+    c:   List[int]        # canal/segmento exclusivo (Black, PremPlat)
+    d:   str              # descuento porcentaje
+    q:   Optional[str]    # cuotas / condición
+    a:   str              # días válidos ("1234567"=todos, "56"=sáb+dom)
+    b:   str              # nombre del comercio
+    ct:  str              # medio de pago (texto)
+    cti: List[int]        # ids canal de pago
+    m:   Optional[str]    # media/imagen
+    r:   List[int]        # rubros: trade/category IDs solamente
+    o:   List[int]        # productos requeridos (vacío = todos)
+    f:   int              # fecha inicio
+    e:   int              # fecha fin
+    pr:  List[int]        # marca tarjeta (151=Visa, 152=MC; siempre presente)
 
 
 class BenefitsAPIConfig(BaseModel):
-    """Configuración para la API de beneficios"""
     base_url: str = "https://www.tevabien.com/json/apps/benefits.aspx"
     default_pagesize: int = 500
-    default_sortcolumn: int = 2
-    default_sortdesc: bool = True
-    default_t: int = 44
 
 
 class BenefitsResponse(BaseModel):
-    """Respuesta de la API de beneficios"""
-    success: bool
-    data: Optional[List[BenefitItem]] = None
-    error: Optional[str] = None
-    url: str
+    success:    bool
+    data:       Optional[List[BenefitItem]] = None
+    error:      Optional[str] = None
+    url:        str
     status_code: int
 
 
-def build_query_params(
-    pagesize: int = 500,
-) -> Dict[str, Any]:
-    """Construye los parámetros de query basándose en las entidades."""
-    params = {"pagesize": pagesize, "allFields": ""}
-    return params
+# ── Caché ────────────────────────────────────────────────────────────────
+
+CACHE_TTL_ALL_BENEFITS = 86400   # 24 horas  — beneficios crudos de la API
+CACHE_TTL_SEARCH_RESULTS = 3600  #  1 hora   — resultados filtrados/ordenados
 
 
-# TTL para caché diario de todos los beneficios (24 horas)
-CACHE_TTL_ALL_BENEFITS = 86400
-CACHE_KEY_ALL_BENEFITS = "all_benefits"
+def _build_search_cache_key(
+    entities: "Entities",
+    user_profile: Optional[dict],
+) -> str:
+    """
+    Genera la clave de caché para un conjunto de resultados filtrados.
+
+    La clave codifica todos los parámetros que determinan el resultado:
+    categoría, días, negocio, segmento, tipo de beneficio, provincia
+    del usuario y productos habilitados.
+
+    El offset (paginación) NO forma parte de la clave porque cacheamos
+    la lista completa y aplicamos el slice después.
+    """
+    profile = user_profile or {}
+    key_parts = {
+        "cat": entities.categoria,
+        "dias": sorted(entities.dias or []),
+        "neg": entities.negocio,
+        "seg": entities.segmento,
+        "tipo": entities.tipo_beneficio,
+        "prov": profile.get("provincia"),
+        "prods": sorted(
+            str(p) for p in (profile.get("productos") or [])
+        ),
+    }
+    key_str = json.dumps(key_parts, sort_keys=True, ensure_ascii=False)
+    h = hashlib.md5(key_str.encode()).hexdigest()
+    return f"benefits:search:{h}"
 
 
 async def _fetch_all_benefits_from_api(
     config: BenefitsAPIConfig,
     headers: Dict[str, str],
     timeout: int = 10,
+    state_id: Optional[int] = None,
 ) -> Optional[List[dict]]:
-    """
-    Obtiene TODOS los beneficios de la API (sin filtros).
-    Esta función solo se llama una vez por día.
-    """
-    params = {"pagesize": 500, "allFields": ""}
+    label = f"state={state_id}" if state_id is not None else "global"
 
+    if MOCK_BENEFITS:
+        data = get_mock_benefits(state_id)
+        print(f"[Mock] Beneficios mock ({label}): {len(data)}")
+        return data
+
+    if state_id is not None:
+        params = {"pagesize": config.default_pagesize, "allfields": "", "state": state_id, "city": 0}
+    else:
+        params = {"pagesize": config.default_pagesize, "allFields": ""}
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.get(
-                config.base_url,
-                params=params,
-                headers=headers,
+                config.base_url, params=params, headers=headers
             )
             response.raise_for_status()
             data = response.json()
-            print(f"[API] Beneficios obtenidos de la API: {len(data)}")
+            print(f"[API] Beneficios obtenidos ({label}): {len(data)}")
             return data
     except Exception as e:
         print(f"[API] Error al obtener beneficios: {e}")
         return None
 
 
+async def _get_cached_for_state(
+    cache_key: str,
+    state_id: Optional[int],
+    config: BenefitsAPIConfig,
+    headers: Dict[str, str],
+    timeout: int,
+) -> Optional[List[dict]]:
+    """Obtiene (o cachea) los beneficios para un único state_id (o global)."""
+    if not CACHE_ENABLED:
+        return await _fetch_all_benefits_from_api(config, headers, timeout, state_id)
+
+    try:
+        cache = await get_cache_service()
+        cached_data = await cache.get(cache_key)
+        if cached_data is not None:
+            print(f"[Cache] HIT: {cache_key}")
+            return cached_data
+
+        print(f"[Cache] MISS: {cache_key} — llamando API...")
+        data = await _fetch_all_benefits_from_api(config, headers, timeout, state_id)
+
+        if data:
+            await cache.set(cache_key, data, ttl=CACHE_TTL_ALL_BENEFITS)
+            print(f"[Cache] SET: {cache_key} (TTL: 24h)")
+
+        return data
+    except Exception as e:
+        print(f"[Cache] Error: {e}")
+        return await _fetch_all_benefits_from_api(config, headers, timeout, state_id)
+
+
 async def _get_all_benefits_cached(
     config: BenefitsAPIConfig,
     headers: Dict[str, str],
     timeout: int = 10,
+    state_ids: Optional[List[int]] = None,
 ) -> Optional[List[dict]]:
     """
-    Obtiene todos los beneficios, usando caché diario.
-    Solo hace una llamada real a la API por día.
+    Obtiene beneficios cacheados por provincia (state_ids) o globales.
+
+    - Sin state_ids → consulta global sin filtro geográfico.
+    - Con un ID     → consulta + caché para ese estado.
+    - Con varios IDs (ej. Buenos Aires, Córdoba) → consulta en paralelo,
+      merge deduplicado por campo `i` (id beneficio).
     """
-    if not CACHE_ENABLED:
-        return await _fetch_all_benefits_from_api(config, headers, timeout)
+    if not state_ids:
+        return await _get_cached_for_state(
+            "all_benefits:global", None, config, headers, timeout
+        )
 
-    try:
-        cache = await get_cache_service()
+    if len(state_ids) == 1:
+        key = f"all_benefits:state:{state_ids[0]}"
+        return await _get_cached_for_state(key, state_ids[0], config, headers, timeout)
 
-        # Intentar obtener del caché
-        cached_data = await cache.get(CACHE_KEY_ALL_BENEFITS)
-        if cached_data is not None:
-            print(f"[Cache] HIT: {CACHE_KEY_ALL_BENEFITS} (caché diario)")
-            return cached_data
+    # Múltiples zonas: fetch en paralelo, luego deduplicar por ID de beneficio
+    tasks = [
+        _get_cached_for_state(
+            f"all_benefits:state:{sid}", sid, config, headers, timeout
+        )
+        for sid in state_ids
+    ]
+    results = await asyncio.gather(*tasks)
 
-        # MISS - hacer llamada a la API
-        print(f"[Cache] MISS: {CACHE_KEY_ALL_BENEFITS} - llamando a la API...")
-        data = await _fetch_all_benefits_from_api(config, headers, timeout)
+    seen: set = set()
+    merged: List[dict] = []
+    for chunk in results:
+        if chunk:
+            for item in chunk:
+                bid = item.get("i")
+                if bid not in seen:
+                    seen.add(bid)
+                    merged.append(item)
 
-        if data:
-            # Guardar en caché por 24 horas
-            await cache.set(CACHE_KEY_ALL_BENEFITS, data, ttl=CACHE_TTL_ALL_BENEFITS)
-            print(f"[Cache] SET: {CACHE_KEY_ALL_BENEFITS} (TTL: 24h)")
-
-        return data
-
-    except Exception as e:
-        print(f"[Cache] Error: {e}")
-        return await _fetch_all_benefits_from_api(config, headers, timeout)
+    print(f"[Cache] Merge {len(state_ids)} zonas -> {len(merged)} beneficios unicos")
+    return merged or None
 
 
-def _apply_filters(data: List[dict], params: Dict[str, Any]) -> List[dict]:
-    """Aplica filtros localmente a los datos."""
-    filtered_data = data
+# ── Filtrado (lógica pura, sin LLM) ──────────────────────────────────────────
 
-    # Filtro por categoría (trade)
-    trade = params.get("trade")
-    if trade:
-        print(f"Filtrando por categoría (trade): {trade}")
-        filtered_data = [
-            item for item in filtered_data if trade in item.get("r", [])
+def _apply_filters(data: List[dict], params: dict) -> List[dict]:
+    """
+    Aplica todos los filtros determinísticos sobre la lista completa.
+
+    Cada filtro es inclusivo: si el parámetro no está presente,
+    no se filtra por ese criterio (devuelve todos).
+
+    Campos del beneficio usados:
+      r[]  → trade IDs (categoría de rubro)
+      a    → string de días "1234567"
+      b    → nombre del comercio
+      pr[] → product IDs requeridos (vacío = todos)
+    """
+    filtered = data
+
+    # 1. Categoría: ANY(trade_id in item["r"])
+    trade_ids = params.get("trade_ids", [])
+    if trade_ids:
+        trade_set = set(trade_ids)
+        filtered = [
+            item for item in filtered
+            if trade_set & set(item.get("r", []))
         ]
+        print(
+            f"[Filter] trade_ids={trade_ids} -> {len(filtered)} beneficios"
+        )
 
-    # Filtro por nombre de negocio
+    # 2. Días: ANY(str(day) in item["a"])
+    days = params.get("days", [])
+    if days:
+        day_strs = {str(d) for d in days}
+        filtered = [
+            item for item in filtered
+            if any(d in str(item.get("a", "")) for d in day_strs)
+        ]
+        print(f"[Filter] days={days} -> {len(filtered)} beneficios")
+
+    # 3. Negocio: substring case-insensitive en nombre del comercio
     negocio = params.get("negocio")
     if negocio:
-        print(f"Filtrando por negocio: {negocio}")
-        negocio_lower = negocio.lower()
-        filtered_data = [
-            item for item in filtered_data
-            if negocio_lower in item.get("b", "").lower()
+        filtered = [
+            item for item in filtered
+            if negocio.lower() in item.get("b", "").lower()
         ]
+        print(
+            f"[Filter] negocio='{negocio}' -> {len(filtered)} beneficios"
+        )
 
-    # Filtro por día
-    # El campo 'a' contiene los días como string: "1234567" = todos, "5" = viernes, etc.
-    day = params.get("day")
-    if day:
-        day_str = str(day)
-        print(f"Filtrando por día: {day_str}")
-        filtered_data = [
-            item for item in filtered_data
-            if day_str in str(item.get("a", ""))
+    # 4. Productos del usuario: o[] vacío (universal) o intersección
+    product_ids = params.get("product_ids", [])
+    if product_ids:
+        pset = set(product_ids)
+        filtered = [
+            item for item in filtered
+            if not item.get("o")               # o[] vacío = para todos
+            or bool(pset & set(item.get("o", [])))
         ]
+        print(
+            f"[Filter] product_ids={product_ids} -> {len(filtered)} "
+            "beneficios"
+        )
 
-    return filtered_data
+    # 5. Tipo de beneficio: t=406 cuotas, t=407 descuento, t=409 ambos
+    benefit_type = params.get("benefit_type")
+    if benefit_type == "cuotas":
+        before = len(filtered)
+        filtered = [
+            item for item in filtered
+            if item.get("t") in (406, 409)
+        ]
+        print(
+            f"[Filter] benefit_type=cuotas -> {len(filtered)} "
+            f"(de {before})"
+        )
+    elif benefit_type == "descuento":
+        before = len(filtered)
+        filtered = [
+            item for item in filtered
+            if item.get("t") in (407, 409)
+        ]
+        print(
+            f"[Filter] benefit_type=descuento -> {len(filtered)} "
+            f"(de {before})"
+        )
 
+    return filtered
+
+
+def _parse_discount(d_str: str) -> float:
+    """
+    Extrae el primer número de un string de descuento.
+
+    Ejemplos:
+      "20%"            → 20.0
+      "15 %"           → 15.0
+      "20% + 3 cuotas" → 20.0
+      "3 cuotas s/i"   → 0.0  (sin porcentaje)
+      ""               → 0.0
+    """
+    import re
+    if not d_str:
+        return 0.0
+    match = re.search(r"(\d+(?:[.,]\d+)?)", str(d_str))
+    if not match:
+        return 0.0
+    return float(match.group(1).replace(",", "."))
+
+
+def _sort_by_discount(data: List[dict]) -> List[dict]:
+    """
+    Ordena los beneficios de mayor a menor porcentaje de descuento.
+
+    Preserva el orden relativo entre items con el mismo descuento.
+    """
+    return sorted(data, key=lambda item: _parse_discount(item.get("d", "")), reverse=True)
+
+
+def _prioritize(data: List[dict], params: dict) -> List[dict]:
+    """
+    Reordena beneficios poniendo los exclusivos del segmento primero.
+
+    No excluye beneficios generales — solo reordena para que el usuario
+    vea sus beneficios exclusivos al inicio de la lista.
+
+    Si is_exclusive_query=True (usuario pidió "mis beneficios black"),
+    devuelve SOLO los del segmento sin los generales.
+    """
+    channel_ids = set(params.get("channel_ids", []))
+    if not channel_ids:
+        return data
+
+    exclusive = [
+        item for item in data
+        if channel_ids & set(item.get("c", []))
+    ]
+    general = [
+        item for item in data
+        if not (channel_ids & set(item.get("c", [])))
+    ]
+
+    if params.get("is_exclusive_query") and exclusive:
+        print(
+            f"[Prioritize] Modo exclusivo: {len(exclusive)} beneficios "
+            "del segmento"
+        )
+        return exclusive
+
+    print(
+        f"[Prioritize] {len(exclusive)} exclusivos + "
+        f"{len(general)} generales"
+    )
+    return exclusive + general
+
+
+# ── Función principal ────────────────────────────────────────────────────
 
 async def fetch_benefits(
     entities: Entities,
+    user_profile: Optional[dict] = None,
     config: Optional[BenefitsAPIConfig] = None,
     timeout: int = 10,
     headers: Optional[Dict[str, str]] = None,
 ) -> BenefitsResponse:
     """
-    Obtiene beneficios filtrados usando caché diario.
+    Obtiene beneficios filtrados y priorizados según entidades + perfil.
 
-    Estrategia de caché:
-    - Caché diario (24hs): Guarda TODOS los beneficios de la API
-    - Cada query aplica filtros localmente sobre el caché diario
-    - No se cachean resultados filtrados (son efímeros)
+    Todo el filtrado es determinístico (Python puro).
+    El LLM solo recibe los resultados ya procesados.
 
     Args:
-        entities: Entidades extraídas del NLP
-        config: Configuración de la API (opcional)
-        timeout: Timeout en segundos (default: 10)
-        headers: Headers HTTP personalizados (opcional)
+        entities:     Entidades extraídas del NLP
+        user_profile: Perfil del usuario de sofia-api-users (opcional)
+        config:       Configuración de la API (opcional)
+        timeout:      Timeout HTTP en segundos
+        headers:      Headers HTTP personalizados (opcional)
 
     Returns:
-        BenefitsResponse con el resultado de la petición
+        BenefitsResponse con lista filtrada y priorizada
     """
     if config is None:
         config = BenefitsAPIConfig()
@@ -220,11 +475,21 @@ async def fetch_benefits(
             "Accept-Language": "es-AR,es;q=0.9",
         }
 
-    filter_entities = get_filter(entities)
+    # Construir parámetros de filtro (toda la lógica de negocio aquí)
+    filter_params = build_filter_params(entities, user_profile)
+    print(f"[Benefits] filter_params={filter_params}")
+
+    # Resolver state IDs a partir de la provincia del perfil
+    provincia = (user_profile or {}).get("provincia")
+    state_ids = _resolve_state_ids(provincia)
+    if provincia:
+        label = f"{provincia} → state_ids={state_ids}" if state_ids else f"{provincia} → fallback global"
+        print(f"[Benefits] {label}")
 
     try:
-        # Obtener TODOS los beneficios del caché diario (o API si expiró)
-        all_benefits = await _get_all_benefits_cached(config, headers, timeout)
+        all_benefits = await _get_all_benefits_cached(
+            config, headers, timeout, state_ids=state_ids
+        )
 
         if all_benefits is None:
             return BenefitsResponse(
@@ -234,13 +499,20 @@ async def fetch_benefits(
                 status_code=0,
             )
 
-        # Aplicar filtros localmente (sin cachear resultados filtrados)
-        filtered_data = _apply_filters(all_benefits, filter_entities)
-        print(f"Beneficios filtrados: {len(filtered_data)} de {len(all_benefits)}")
+        # Filtrar → priorizar → ordenar por descuento
+        filtered = _apply_filters(all_benefits, filter_params)
+        prioritized = _prioritize(filtered, filter_params)
+        sorted_data = _sort_by_discount(prioritized)
+
+        print(
+            f"[Benefits] {len(all_benefits)} total -> "
+            f"{len(filtered)} filtrados -> "
+            f"{len(sorted_data)} ordenados"
+        )
 
         return BenefitsResponse(
             success=True,
-            data=filtered_data,
+            data=sorted_data,
             url="(from-daily-cache)",
             status_code=200,
         )
@@ -254,6 +526,8 @@ async def fetch_benefits(
         )
 
 
+# ── Tool LangChain ───────────────────────────────────────────────────────
+
 @tool
 async def search_benefits(
     query: str,
@@ -266,35 +540,29 @@ async def search_benefits(
 
     Args:
         query    : Consulta del usuario en lenguaje natural.
-        categoria: Categoría del comercio. Opciones: belleza, vehiculos,
-                   supermercados, librerias, combustible, moda, turismo,
-                   vinotecas, hogar/deco, promos del mes, e-commerce,
-                   gastronomia, salud, transporte, jugueterias,
-                   entretenimiento.
-        dia      : Día de la semana (lunes, martes, miercoles, jueves,
-                   viernes, sabado, domingo).
+        categoria: Categoría del comercio. Opciones: gastronomia, bares,
+                   moda, supermercados, belleza, salud, turismo, vehiculos,
+                   combustible, librerias, entretenimiento, hogar_deco,
+                   ecommerce, transporte, jugueterias, promos_del_mes,
+                   vinotecas, mascotas, cercanos, modo, cine, deportes.
+        dia      : Día(s): lunes, martes, miercoles, jueves, viernes,
+                   sabado, domingo, fin de semana, lunes a viernes.
         negocio  : Nombre de un comercio específico (ej: carrefour, ypf).
 
     Returns:
-        dict con lista de beneficios: comercio, descuento, medio de pago.
+        dict con lista de beneficios filtrados y priorizados.
     """
-    entities = Entities(
-        categoria=categoria,
-        dia=dia,
-        negocio=negocio,
-    )
+    # Convertir dia (str) a lista para soportar multi-día
+    dias = None
+    if dia:
+        dias = [dia]
 
-    print(
-        f"[search_benefits] query='{query}' | "
-        f"categoria={categoria}, dia={dia}, negocio={negocio}"
-    )
+    entities = Entities(categoria=categoria, dias=dias, negocio=negocio)
+    response = await fetch_benefits(entities, user_profile=None)
 
-    response = await fetch_benefits(entities)
-
-    datas_json = [
-        normalize_promo(b.model_dump())
-        for b in (response.data or [])[:5]
-    ]
+    # Serializar top 10 al LLM (reducir tokens)
+    top = (response.data or [])[:5]
+    datas_json = [normalize_promo(b.model_dump()) for b in top]
 
     result: dict = {"data": datas_json}
     if response.error:
@@ -302,12 +570,113 @@ async def search_benefits(
     return result
 
 
-# Demo
-if __name__ == "__main__":
-    import asyncio
+async def search_benefits_with_profile(
+    query: str,
+    entities: Entities,
+    user_profile: Optional[dict] = None,
+    offset: int = 0,
+) -> dict:
+    """
+    Versión extendida de search_benefits con user_profile completo.
 
+    Llamada directamente desde benefits_agent (no por el LLM).
+    Aplica filtrado y priorización por segmento del usuario.
+
+    Estrategia de caché (1h TTL):
+      - Clave: hash de (categoria, dias, negocio, segmento, tipo_beneficio,
+        provincia, productos).  El offset NO forma parte de la clave.
+      - Se cachea la lista completa normalizada (todos los resultados
+        filtrados, no solo el top-5). El slice por offset se aplica
+        sobre la lista cacheada.
+      - Invalidación implícita: el TTL es inferior al de all_benefits
+        (24h), por lo que siempre expira antes de que el dataset diario
+        se renueve.
+
+    Args:
+        query:        Texto original del usuario (para logging)
+        entities:     Entidades ya clasificadas
+        user_profile: Perfil completo del usuario
+        offset:       Posición inicial para paginación (ver_mas)
+
+    Returns:
+        dict con data[] (top 5 priorizados) y metadata de filtrado
+    """
+    print(
+        f"[search_benefits_with_profile] query='{query}' | "
+        f"cat={entities.categoria}, dias={entities.dias}, "
+        f"neg={entities.negocio}, "
+        f"seg={entities.segmento or 'N/A'}, offset={offset}"
+    )
+
+    # ── Intento de caché ──────────────────────────────────────────────
+    cache_key = _build_search_cache_key(entities, user_profile)
+    all_normalized: Optional[List[dict]] = None
+    api_error: Optional[str] = None
+
+    if CACHE_ENABLED:
+        try:
+            cache = await get_cache_service()
+            cached = await cache.get(cache_key)
+            if cached is not None:
+                print(
+                    f"[Cache] HIT search: {cache_key[-12:]} "
+                    f"({len(cached)} items)"
+                )
+                all_normalized = cached
+        except Exception as ce:
+            print(f"[Cache] Error leyendo search cache: {ce}")
+
+    # ── Cache MISS: ejecutar filtrado completo ────────────────────────
+    if all_normalized is None:
+        response = await fetch_benefits(
+            entities, user_profile=user_profile
+        )
+        all_data = response.data or []
+        # Normalizar TODOS los items (no solo el top-5)
+        # para poder paginar correctamente desde el caché.
+        all_normalized = [
+            normalize_promo(b.model_dump()) for b in all_data
+        ]
+        api_error = response.error
+
+        if CACHE_ENABLED and all_normalized:
+            try:
+                cache = await get_cache_service()
+                await cache.set(
+                    cache_key,
+                    all_normalized,
+                    ttl=CACHE_TTL_SEARCH_RESULTS,
+                )
+                print(
+                    f"[Cache] SET search: {cache_key[-12:]} "
+                    f"({len(all_normalized)} items, TTL=1h)"
+                )
+            except Exception as ce:
+                print(f"[Cache] Error guardando search cache: {ce}")
+
+    # ── Paginación sobre la lista completa (cacheada o recién filtrada) ─
+    total = len(all_normalized)
+    top = all_normalized[offset:offset + 5]
+    mostrando = len(top)
+    restantes = max(0, total - offset - mostrando)
+
+    result: dict = {
+        "data": top,
+        "total": total,
+        "mostrando": mostrando,
+        "restantes": restantes,
+        "hay_mas": restantes > 0,
+    }
+    if api_error:
+        result["error"] = api_error
+    return result
+
+
+# ── Demo ─────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
     async def main():
-        query = "promociones en moda"
+        query = "promociones en gastronomia"
         print(f"Query: {query}\n")
         result = await search_benefits.ainvoke({"query": query})
         print(f"Beneficios encontrados: {len(result.get('data', []))}")

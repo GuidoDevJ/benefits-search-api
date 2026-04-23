@@ -2,32 +2,40 @@
 FastAPI — API REST + Gradio UI para el sistema de búsqueda de beneficios.
 
 Rutas:
-  GET  /           → health check
-  POST /benefits   → API REST (JSON)
-  GET  /audit/session/{id} → detalle de sesión auditada
-  GET  /chat       → interfaz Gradio (montada como sub-app)
+  GET  /                       → health check
+  POST /benefits               → API REST (JSON)
+  DELETE /benefits/memory      → limpia historial de un usuario
+  GET  /audit/session/{id}     → detalle de sesión auditada
+  GET  /chat                   → interfaz Gradio (montada como sub-app)
 """
 
-import time
 from contextlib import asynccontextmanager
+from typing import Optional
 from uuid import uuid4
 
 import gradio as gr
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from langchain_core.messages import HumanMessage
 from pydantic import BaseModel
 
-from ..config import AUDIT_ENABLED, BEDROCK_MODEL_ID
-from ..graph import get_graph
-from ..tools.query_pipeline import classify_and_validate
+from ..config import (
+    AUDIT_ENABLED,
+    BEDROCK_MODEL_ID,
+    MEMORY_ENABLED,
+)
 from ..ui.audit_interface import create_audit_interface
 from ..ui.chat_interface import create_chat_interface
+from ..services.query_orchestrator import get_orchestrator
 
 
 class QueryRequest(BaseModel):
     query: str
+    phone_number: Optional[str] = None   # Número WhatsApp del usuario
+
+
+class ClearMemoryRequest(BaseModel):
+    phone_number: str
 
 
 @asynccontextmanager
@@ -43,9 +51,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# ── Gradio montado en /chat y /audit-ui ─────────────────────────────────────
-# Ambas interfaces corren en el mismo proceso uvicorn en el puerto 8000.
-# WebSockets de Gradio requieren WORKERS=1 o sticky sessions en el ALB.
+# ── Gradio montado en /chat y /audit-ui ──────────────────────────────────────
 app = gr.mount_gradio_app(app, create_chat_interface(), path="/chat")
 app = gr.mount_gradio_app(app, create_audit_interface(), path="/audit-ui")
 
@@ -72,33 +78,9 @@ async def read_root():
     )
 
 
-def _extract_response(result: dict) -> str:
-    try:
-        final_message = result["messages"][-1]
-        if hasattr(final_message, "content"):
-            if isinstance(final_message.content, str):
-                return final_message.content
-            elif isinstance(final_message.content, dict):
-                return final_message.content.get(
-                    "message", str(final_message.content)
-                )
-            return str(final_message.content)
-        return str(final_message)
-    except Exception as exc:
-        return f"Error al procesar la respuesta: {exc}"
-
-
 @app.get("/audit/session/{session_id}")
 async def get_audit_session(session_id: str):
-    """
-    Devuelve el resumen y todos los registros de auditoría de una sesión.
-
-    Response:
-        {
-            "session": { ...SessionSummary... },
-            "records": [ ...AuditRecord... ]
-        }
-    """
+    """Devuelve el resumen y registros de auditoría de una sesión."""
     if not AUDIT_ENABLED:
         raise HTTPException(
             status_code=503,
@@ -133,67 +115,45 @@ async def get_audit_session(session_id: str):
     })
 
 
+@app.delete("/benefits/memory")
+async def clear_user_memory(req: ClearMemoryRequest):
+    """Limpia el historial de conversación de un usuario."""
+    if not MEMORY_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="Memoria deshabilitada (MEMORY_ENABLED=false)",
+        )
+    from ..memory import get_memory_service
+    memory = await get_memory_service()
+    await memory.clear(req.phone_number)
+    return JSONResponse(content={
+        "ok": True,
+        "message": f"Historial limpiado para {req.phone_number[-4:]}",
+    })
+
+
 @app.post("/benefits")
 async def get_benefits(query: QueryRequest):
+    """Endpoint principal de búsqueda de beneficios."""
     session_id = str(uuid4())
-    t_start = time.monotonic()
+    phone = (query.phone_number or "").strip() or None
     audit_service = None
 
     if AUDIT_ENABLED:
         from ..audit.audit_service import get_audit_service
         audit_service = await get_audit_service()
 
-    print(f"[API] session={session_id[:8]} query={query.query!r}")
     try:
-        # ── 1. Validación y clasificación (igual que Gradio) ────────────
-        classification_dict, rejection = await classify_and_validate(
-            query.query
+        result = await get_orchestrator().handle(
+            query=query.query,
+            phone=phone,
+            session_id=session_id,
+            audit_service=audit_service,
+            log_prefix="[API]",
         )
-
-        if audit_service:
-            await audit_service.record_user_input(
-                session_id=session_id,
-                model_id=BEDROCK_MODEL_ID,
-                query=query.query,
-                nlp_result=classification_dict or {"intent": "unknown"},
-            )
-
-        if rejection:
-            if audit_service:
-                total_ms = int((time.monotonic() - t_start) * 1000)
-                await audit_service.record_final_response(
-                    session_id=session_id,
-                    model_id=BEDROCK_MODEL_ID,
-                    response=rejection,
-                    total_latency_ms=total_ms,
-                )
-            return JSONResponse(content={
-                "response": rejection,
-                "session_id": session_id,
-            })
-
-        # ── 2. Invocar grafo con clasificación pre-computada ────────────
-        result = await get_graph().ainvoke({
-            "messages": [HumanMessage(content=query.query)],
-            "next": "",
-            "context": {"classification": classification_dict},
-            "session_id": session_id,
-            "audit_service": audit_service,
-        })
-        response_content = _extract_response(result)
-
-        if audit_service:
-            total_ms = int((time.monotonic() - t_start) * 1000)
-            await audit_service.record_final_response(
-                session_id=session_id,
-                model_id=BEDROCK_MODEL_ID,
-                response=response_content,
-                total_latency_ms=total_ms,
-            )
-
         return JSONResponse(content={
-            "response": response_content,
-            "session_id": session_id,
+            "response": result.response,
+            "session_id": result.session_id,
         })
 
     except Exception as exc:
