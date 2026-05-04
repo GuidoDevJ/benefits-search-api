@@ -112,6 +112,61 @@ def _recover_classification_from_history(history: list) -> Optional[dict]:
     return None
 
 
+# ── Rescate de gathering activo ───────────────────────────────────────────
+
+def _rescue_gathering_response(
+    query: str,
+    gathering_ctx: dict,
+) -> Optional[Any]:
+    """
+    Interpreta una respuesta corta del usuario cuando hay un gathering activo.
+
+    El LLM sin historial clasifica "entretenimiento" o "combustible" como
+    intent="unknown" porque son palabras sueltas sin señal de beneficio.
+    Este helper agrega un hint ("beneficios <query>") para activar
+    fast_classify y hereda dias/provincia del gathering anterior.
+
+    Se invoca SOLO cuando intent="unknown" + search_context.gathering=True,
+    es decir cuando el bot hizo una pregunta de clarificación y el usuario
+    está respondiendo con la categoría o entidad que faltaba.
+
+    Returns:
+        Classification con intent="benefits" si pudo inferir, None si no.
+    """
+    try:
+        from ..tools.fast_classifier import fast_classify
+        from ..tools.llm_classifier import Classification
+    except ImportError:
+        from src.tools.fast_classifier import fast_classify
+        from src.tools.llm_classifier import Classification
+
+    # Agregar señal explícita de beneficio para activar fast_classify.
+    # Ej: "entretenimiento" → fast_classify("beneficios entretenimiento")
+    # devuelve Classification(intent="benefits", categoria="entretenimiento")
+    clf = fast_classify(f"beneficios {query.strip()}")
+    if clf is None or clf.intent != "benefits":
+        return None
+
+    # Heredar días y provincia del contexto de gathering previo si la
+    # respuesta corta del usuario no los incluye.
+    inherited_dias: Optional[list] = gathering_ctx.get("dias") or (
+        [gathering_ctx["dia"]] if gathering_ctx.get("dia") else None
+    )
+    return Classification(
+        intent="benefits",
+        categoria_benefits=clf.categoria_benefits,
+        negocio=clf.negocio,
+        segmento=clf.segmento,
+        tipo_beneficio=clf.tipo_beneficio,
+        provincia=clf.provincia or gathering_ctx.get("provincia"),
+        dias=clf.dias or inherited_dias,
+        dia=(
+            clf.dia
+            or (inherited_dias[0] if inherited_dias and len(inherited_dias) == 1 else None)
+        ),
+    )
+
+
 # ── Resultado del orquestador ─────────────────────────────────────────────
 
 @dataclass
@@ -247,6 +302,16 @@ class QueryOrchestrator:
             except Exception as exc:
                 print(f"{log_prefix} Error cargando prefs: {exc}")
 
+        # ── 3b. Cargar search_context (temprano para rescue de gathering) ──
+        # Debe cargarse ANTES del check de intent="unknown" para que el
+        # rescue pueda usarlo cuando el usuario responde a una clarificación.
+        search_context: dict = {}
+        if phone and prefs_svc:
+            try:
+                search_context = await prefs_svc.load_search_context(phone)
+            except Exception:
+                pass
+
         # ── 4. intent="location" → guardar ciudad, salida temprana ───────
         if classification.intent == "location" and classification.provincia:
             from ..models.queries_types import PROVINCES
@@ -279,7 +344,23 @@ class QueryOrchestrator:
                 total_ms=total_ms,
             )
 
-        # ── 5. intent="unknown" → callback + salida temprana ─────────────
+        # ── 5. intent="unknown" → rescue gathering o salida temprana ────────
+        if classification.intent == "unknown":
+            # Si hay un gathering activo el usuario está respondiendo a una
+            # pregunta de clarificación. El LLM sin historial clasifica
+            # "entretenimiento" como unknown; intentamos interpretarlo
+            # como categoría/entidad antes de renderizar el error.
+            if search_context.get("gathering"):
+                rescued = _rescue_gathering_response(query, search_context)
+                if rescued is not None:
+                    print(
+                        f"{log_prefix} Gathering rescue: "
+                        f"'{query}' → cat={rescued.categoria_benefits} "
+                        f"dias={rescued.dias}"
+                    )
+                    classification = rescued
+                    classification_dict = classification.model_dump()
+
         if classification.intent == "unknown":
             if on_unknown_query:
                 try:
@@ -362,15 +443,7 @@ class QueryOrchestrator:
             f"query={query!r} historial={len(history)} msgs"
         )
 
-        # ── 10. Cargar search_context ─────────────────────────────────────
-        search_context: dict = {}
-        if phone and prefs_svc:
-            try:
-                search_context = await prefs_svc.load_search_context(phone)
-            except Exception:
-                pass
-
-        # ── 11. Resolver graph_context ────────────────────────────────────
+        # ── 10. Resolver graph_context ────────────────────────────────────
         graph_context: dict = {}
         merged_clf: dict = {}
 
@@ -444,6 +517,30 @@ class QueryOrchestrator:
             gathering = (
                 search_context if search_context.get("gathering") else {}
             )
+
+            # Soft-hint: si la búsqueda anterior tenía categoría y la nueva
+            # clasificación no detectó ninguna (ej: "ofertas en combustibles"
+            # donde "combustibles" plural no matcheó el keyword singular),
+            # heredar la categoría previa para evitar una clarificación
+            # innecesaria. Solo aplica cuando no hay gathering activo.
+            if (
+                not search_context.get("gathering")
+                and search_context.get("categoria_benefits")
+                and not classification_dict.get("categoria_benefits")
+                and not classification_dict.get("negocio")
+                and classification.intent == "benefits"
+            ):
+                gathering = {
+                    k: search_context[k]
+                    for k in ("categoria_benefits", "provincia")
+                    if k in search_context
+                }
+                print(
+                    f"{log_prefix} Soft-hint: heredando "
+                    f"cat={gathering.get('categoria_benefits')} "
+                    "del search_context anterior"
+                )
+
             merged_clf = _merge_context(gathering, classification_dict)
 
             needs_more, clarification_q = _needs_clarification(

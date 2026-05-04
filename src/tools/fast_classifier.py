@@ -246,6 +246,10 @@ _SINGLE_DAYS: list[str] = [
     "jueves", "viernes", "sabado", "domingo",
 ]
 
+# Tokens de día que terminan en 's': excluidos de la singularización
+# para evitar que "lunes" → "lune" dé falsos positivos en keywords.
+_DAYS_WITH_S_SUFFIX = frozenset({"lunes", "martes", "viernes"})
+
 
 def _detect_days(text: str) -> Optional[list[str]]:
     """
@@ -274,6 +278,49 @@ _LOCATION_PREFIXES = (
     "me encuentro en ", "mi ciudad es ", "mi zona es ",
     "mi provincia es ", "en ",
 )
+
+
+# ── Matching de categoría ────────────────────────────────────────────────
+
+def _match_category(text: str, tokens: set[str]) -> Optional[str]:
+    """
+    Busca la categoría de comercio en el texto normalizado.
+
+    Estrategia (en orden de prioridad):
+      1. Nombre canónico de la categoría  → "entretenimiento" matchea
+         la clave "entretenimiento" aunque no esté en el keyword set.
+      2. Keywords exactas del set (token match directo).
+      3. Forma singular del token plural  → "combustibles" → "combustible",
+         cubre el 90 % de los plurales españoles en este dominio.
+      4. Keywords multi-palabra (substring sobre el texto normalizado).
+
+    La singularización excluye días de semana que terminan en 's'
+    (lunes, martes, viernes) para evitar "lune", "marte", "vierne".
+    """
+    singular_tokens: set[str] = {
+        t[:-1]
+        if (t.endswith("s") and len(t) > 3 and t not in _DAYS_WITH_S_SUFFIX)
+        else t
+        for t in tokens
+    }
+
+    for cat, keywords in _CATEGORY_KEYWORDS.items():
+        # 1. Nombre canónico (singular o plural simple: cat + 's')
+        if cat in tokens or cat in singular_tokens:
+            return cat
+
+        multi = {kw for kw in keywords if " " in kw}
+        single = keywords - multi
+
+        # 2 + 3. Keyword exacta o singularizada
+        if single & tokens or single & singular_tokens:
+            return cat
+
+        # 4. Frases multi-palabra (substring)
+        if any(kw in text for kw in multi):
+            return cat
+
+    return None
 
 
 # ── Clasificador principal ────────────────────────────────────────────────
@@ -342,14 +389,7 @@ def fast_classify(query: str) -> Optional[Classification]:
             break
 
     # ── Categoría ─────────────────────────────────────────────────────
-    # Primero buscar frases multi-token, luego tokens individuales
-    categoria: Optional[str] = None
-    for cat, keywords in _CATEGORY_KEYWORDS.items():
-        multi = {kw for kw in keywords if " " in kw}
-        single = keywords - multi
-        if (single & tokens) or any(kw in text for kw in multi):
-            categoria = cat
-            break
+    categoria = _match_category(text, tokens)
 
     # ── Intent ────────────────────────────────────────────────────────
     has_signal = (
