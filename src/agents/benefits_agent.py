@@ -191,12 +191,17 @@ def _validate_tool_result(tool_result: dict) -> dict:
                 f"[Benefits] Item descartado por estructura inválida: {keys}"
             )
 
-    # Actualizar contadores si hubo descartes
+    # Sync all pagination counters when items are discarded
     discarded = len(data) - len(valid_items)
     if discarded > 0:
         print(f"[Benefits] {discarded} items descartados por validación")
+        n = len(valid_items)
+        offset = result.get("offset", 0)
         result["data"] = valid_items
-        result["mostrando"] = len(valid_items)
+        result["mostrando"] = n
+        result["total"] = n
+        result["restantes"] = 0
+        result["hay_mas"] = False
 
     return result
 
@@ -256,10 +261,12 @@ def _build_system_prompt(
     else:
         # Caso C: resultados válidos → validar estructura y formatear
         validated = _validate_tool_result(tool_result)
+        n_shown = len(validated.get("data", []))
         result_block = (
             f"RESULTADOS DE BÚSQUEDA:\n{serializer.serialize(validated)}\n\n"
-            "INSTRUCCIÓN: Formateá estos resultados para el usuario "
-            "según las reglas del prompt."
+            f"INSTRUCCIÓN: Hay exactamente {n_shown} beneficio(s) en el resultado. "
+            f"Usá ese número exacto al mencionarlos — nunca inventes ni redondees. "
+            "Formateá estos resultados para el usuario según las reglas del prompt."
         )
 
     sections.append(result_block)

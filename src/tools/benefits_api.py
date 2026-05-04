@@ -141,6 +141,7 @@ class BenefitsResponse(BaseModel):
 
 CACHE_TTL_ALL_BENEFITS = 86400   # 24 h — beneficios crudos de la API
 CACHE_TTL_SEARCH_RESULTS = 3600  #  1 h — resultados filtrados/ordenados
+PAGE_SIZE = 5
 
 
 def _build_search_cache_key(
@@ -680,7 +681,7 @@ async def search_benefits_with_profile(
 
     # ── Paginación sobre la lista completa (cacheada o recién filtrada) ─
     total = len(all_normalized)
-    top = all_normalized[offset:offset + 5]
+    top = all_normalized[offset:offset + PAGE_SIZE]
     mostrando = len(top)
     restantes = max(0, total - offset - mostrando)
 
