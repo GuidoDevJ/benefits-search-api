@@ -300,6 +300,9 @@ class AuditService:
     # ------------------------------------------------------------------
 
     async def get_session(self, session_id: str) -> Optional[SessionSummary]:
+        # In-memory cache first — avoids CloudWatch Logs Insights eventual consistency delay
+        if session_id in self._sessions:
+            return self._sessions[session_id]
         return await self._storage.get_session_summary(session_id)
 
     async def get_session_records(self, session_id: str) -> list[AuditRecord]:

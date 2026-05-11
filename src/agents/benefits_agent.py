@@ -428,6 +428,12 @@ def create_benefits_agent(llm: ChatBedrock):
             except Exception as fb_exc:
                 print(f"[Benefits] Fallback search failed: {fb_exc}")
 
+        tool_api_error = bool(
+            tool_result
+            and tool_result.get("error")
+            and not (tool_result.get("data") or [])
+        )
+
         if audit_service and session_id:
             await audit_service.record_tool_execution(
                 session_id=session_id,
@@ -444,7 +450,7 @@ def create_benefits_agent(llm: ChatBedrock):
                 },
                 tool_result=tool_result,
                 latency_ms=tool_latency_ms,
-                is_error=tool_error is not None,
+                is_error=tool_error is not None or tool_api_error,
                 error=tool_error,
             )
 

@@ -208,7 +208,7 @@ async def _fetch_all_benefits_from_api(
             return data
     except Exception as e:
         print(f"[API] Error al obtener beneficios: {e}")
-        return None
+        raise
 
 
 async def _get_cached_for_state(
@@ -224,28 +224,30 @@ async def _get_cached_for_state(
             config, headers, timeout, state_id
         )
 
+    # Intentar leer desde caché (solo los errores de Redis se ignoran)
+    cached_data = None
     try:
         cache = await get_cache_service()
         cached_data = await cache.get(cache_key)
-        if cached_data is not None:
-            print(f"[Cache] HIT: {cache_key}")
-            return cached_data
+    except Exception as e:
+        print(f"[Cache] Error leyendo caché: {e}")
 
-        print(f"[Cache] MISS: {cache_key} — llamando API...")
-        data = await _fetch_all_benefits_from_api(
-            config, headers, timeout, state_id
-        )
+    if cached_data is not None:
+        print(f"[Cache] HIT: {cache_key}")
+        return cached_data
 
+    print(f"[Cache] MISS: {cache_key} — llamando API...")
+    data = await _fetch_all_benefits_from_api(config, headers, timeout, state_id)
+
+    try:
         if data:
+            cache = await get_cache_service()
             await cache.set(cache_key, data, ttl=CACHE_TTL_ALL_BENEFITS)
             print(f"[Cache] SET: {cache_key} (TTL: 24h)")
-
-        return data
     except Exception as e:
-        print(f"[Cache] Error: {e}")
-        return await _fetch_all_benefits_from_api(
-            config, headers, timeout, state_id
-        )
+        print(f"[Cache] Error guardando caché: {e}")
+
+    return data
 
 
 async def _get_all_benefits_cached(
