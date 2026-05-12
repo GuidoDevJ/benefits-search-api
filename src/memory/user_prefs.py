@@ -27,6 +27,13 @@ except ImportError:
 PREFS_KEY_PREFIX = "comafi:prefs:"
 PREFS_TTL = 30 * 24 * 3600  # 30 días
 
+# Campos de clasificación relevantes para repetir una búsqueda.
+# Excluye deliberadamente: intent, page, offset, gathering.
+_SEARCH_RELEVANT_FIELDS = frozenset({
+    "categoria_benefits", "dias", "dia", "negocio",
+    "segmento", "tipo_beneficio", "provincia",
+})
+
 # Fallback en memoria cuando Redis no está disponible (ej: dev local).
 # Persiste mientras el proceso esté vivo; se pierde al reiniciar.
 _memory_fallback: dict[str, dict] = {}
@@ -123,6 +130,39 @@ class UserPrefsService:
         prefs = await self.load(phone)
         prefs.pop("search_context", None)
         return await self.save(phone, prefs)
+
+    async def save_last_full_search(self, phone: str, classification: dict) -> bool:
+        """
+        Persiste los campos de búsqueda relevantes de la última clasificación
+        ejecutada (non-gathering). Sirve como fallback para ver_mas cuando
+        search_context haya expirado o no esté disponible entre instancias.
+
+        El snapshot incluye un _expires_at (Unix timestamp) para aplicar
+        un TTL lógico de 24 horas independiente del TTL de la clave Redis.
+        """
+        import time
+        snapshot = {
+            k: v for k, v in classification.items()
+            if k in _SEARCH_RELEVANT_FIELDS and v is not None
+        }
+        if not snapshot:
+            return True
+        snapshot["_expires_at"] = time.time() + 24 * 3600
+        return await self.update(phone, last_full_search=snapshot)
+
+    async def load_last_full_search(self, phone: str) -> dict:
+        """
+        Carga la última clasificación de búsqueda persistida.
+        Retorna {} si no existe o si expiró hace más de 24 horas.
+        """
+        import time
+        prefs = await self.load(phone)
+        data = prefs.get("last_full_search") or {}
+        if not data:
+            return {}
+        if time.time() > data.get("_expires_at", 0):
+            return {}
+        return {k: v for k, v in data.items() if k != "_expires_at"}
 
     async def update_search_prefs(
         self,

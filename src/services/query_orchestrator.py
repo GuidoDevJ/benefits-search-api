@@ -112,6 +112,27 @@ def _recover_classification_from_history(history: list) -> Optional[dict]:
     return None
 
 
+def _count_benefits_pages_in_history(history: list) -> int:
+    """
+    Cuenta cuántas páginas de beneficios ya se mostraron en la conversación
+    escaneando los AIMessages del historial.
+
+    Se usa para estimar el offset correcto cuando search_context expiró
+    y el bot necesita continuar la paginación sin perder el lugar.
+    """
+    _MARKERS = ("🎁", "beneficio", "descuento", "% off", "cuotas")
+    count = 0
+    for msg in history:
+        if not isinstance(msg, AIMessage):
+            continue
+        content = (
+            msg.content if isinstance(msg.content, str) else str(msg.content)
+        ).lower()
+        if any(m in content for m in _MARKERS):
+            count += 1
+    return count
+
+
 # ── Rescate de gathering activo ───────────────────────────────────────────
 
 def _rescue_gathering_response(
@@ -469,50 +490,76 @@ class QueryOrchestrator:
                     "offset": (page - 1) * 5,
                 }
             else:
-                # ── Fallback: search_context ausente o expirado ───────────
-                # Escanear el historial en orden inverso para recuperar la
-                # última clasificación válida y continuar desde página 2.
-                # Esto permite que "sí" / "dale" funcionen aunque Redis haya
-                # expirado el search_context o sea una sesión nueva.
+                # ── Cadena de fallback cuando search_context está ausente ──
+                # Nivel 1: re-clasificar mensajes anteriores del historial
                 recovered_clf = _recover_classification_from_history(history)
+
+                # Nivel 2: last_full_search guardado en Redis/prefs.
+                # Cubre el caso más común: query abreviada o LLM-clasificada
+                # donde fast_classify no puede re-clasificar el mensaje.
+                if not recovered_clf and prefs_svc and phone:
+                    try:
+                        recovered_clf = await prefs_svc.load_last_full_search(phone)
+                        if recovered_clf:
+                            print(
+                                f"{log_prefix} ver_mas: recuperado de "
+                                f"last_full_search — "
+                                f"cat={recovered_clf.get('categoria_benefits')} "
+                                f"dias={recovered_clf.get('dias')}"
+                            )
+                    except Exception:
+                        pass
+
                 if recovered_clf:
-                    print(
-                        f"{log_prefix} ver_mas sin search_context — "
-                        f"recuperado del historial: "
-                        f"cat={recovered_clf.get('categoria_benefits')} "
-                        f"dias={recovered_clf.get('dias')}"
-                    )
+                    # Estimar la página correcta contando respuestas de
+                    # beneficios ya mostradas, para no repetir desde el inicio.
+                    pages_shown = max(_count_benefits_pages_in_history(history), 1)
                     recovered_clf["intent"] = "benefits"
-                    recovered_clf["page"] = 2
+                    recovered_clf["page"] = pages_shown + 1
                     merged_clf = recovered_clf
                     graph_context = {
                         "classification": merged_clf,
-                        "offset": 5,
+                        "offset": pages_shown * 5,
                     }
                 else:
-                    # Sin historial recuperable: respuesta conversacional
-                    # (primera interacción o historial solo afirmativos)
-                    resp = (
-                        "¿Qué tipo de beneficios querés ver? "
-                        "Podés pedirme gastronomía, supermercados, "
-                        "combustible, moda, cine, y muchas categorías más."
-                    )
-                    total_ms = int((time.monotonic() - t_start) * 1000)
-                    if audit_service:
-                        await audit_service.record_final_response(
-                            session_id=session_id,
-                            model_id=BEDROCK_MODEL_ID,
-                            response=resp,
-                            total_latency_ms=total_ms,
+                    # Nivel 3: last_categoria de user_prefs (ya cargado,
+                    # sin call extra a Redis). Garantiza que al menos se
+                    # repite la categoría correcta en lugar de pedir aclaración.
+                    last_cat = user_prefs.get("last_categoria") if user_prefs else None
+                    if last_cat:
+                        print(
+                            f"{log_prefix} ver_mas: usando last_categoria "
+                            f"de prefs: {last_cat}"
                         )
-                    return OrchestratorResult(
-                        response=resp,
-                        session_id=session_id,
-                        user_profile=user_profile_dict,
-                        user_prefs=user_prefs,
-                        is_early_exit=True,
-                        total_ms=total_ms,
-                    )
+                        merged_clf = {
+                            "intent": "benefits",
+                            "categoria_benefits": last_cat,
+                            "page": 2,
+                        }
+                        graph_context = {"classification": merged_clf, "offset": 5}
+                    else:
+                        # Sin ningún contexto recuperable: respuesta genérica
+                        resp = (
+                            "¿Qué tipo de beneficios querés ver? "
+                            "Podés pedirme gastronomía, supermercados, "
+                            "combustible, moda, cine, y muchas categorías más."
+                        )
+                        total_ms = int((time.monotonic() - t_start) * 1000)
+                        if audit_service:
+                            await audit_service.record_final_response(
+                                session_id=session_id,
+                                model_id=BEDROCK_MODEL_ID,
+                                response=resp,
+                                total_latency_ms=total_ms,
+                            )
+                        return OrchestratorResult(
+                            response=resp,
+                            session_id=session_id,
+                            user_profile=user_profile_dict,
+                            user_prefs=user_prefs,
+                            is_early_exit=True,
+                            total_ms=total_ms,
+                        )
         else:
             gathering = (
                 search_context if search_context.get("gathering") else {}
@@ -588,6 +635,12 @@ class QueryOrchestrator:
                     await prefs_svc.save_search_context(
                         phone, merged_clf, gathering=False
                     )
+                except Exception:
+                    pass
+
+            if phone and prefs_svc:
+                try:
+                    await prefs_svc.save_last_full_search(phone, merged_clf)
                 except Exception:
                     pass
 
