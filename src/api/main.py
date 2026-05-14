@@ -145,8 +145,13 @@ async def get_benefits(query: QueryRequest):
             log_prefix="[API]",
         )
         return JSONResponse(content={
-            "response": result.response,
-            "session_id": result.session_id,
+            "response": {
+                "type": "success",
+                "data": {
+                    "message": result.response,
+                    "session_id": result.session_id,
+                },
+            },
         })
 
     except Exception as exc:
@@ -162,6 +167,14 @@ async def get_benefits(query: QueryRequest):
             )
 
         return JSONResponse(
-            content={"error": error_msg, "session_id": session_id},
+            content={
+                "response": {
+                    "type": "error",
+                    "data": {
+                        "message": error_msg,
+                        "session_id": session_id,
+                    },
+                },
+            },
             status_code=500,
         )
