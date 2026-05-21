@@ -111,7 +111,11 @@ Si no se menciona ubicación → null
 
 SEGMENTO (solo si el usuario menciona explícitamente su segmento):
 Uno de: {_SEGMENTS}
-Ejemplos: "mis beneficios black" → "black", "soy premium" → "premium"
+Regla clave: solo completar segmento cuando hay intención de buscar beneficios.
+- "mis beneficios black" → intent="benefits", segmento="black"
+- "beneficios premium en gastronomía" → intent="benefits", segmento="premium"
+- "soy premium" / "soy black" / "cliente black" → intent="unknown"
+  (el usuario se identifica pero NO pide beneficios — no hay señal de búsqueda)
 Si no se menciona → null
 
 TIPO_BENEFICIO (solo si intent=benefits y el usuario especifica preferencia):

@@ -227,6 +227,77 @@ _NEGOCIO_PATTERNS: list[tuple[re.Pattern, str]] = [
     for key, name in _KNOWN_NEGOCIOS.items()
 ]
 
+# ── Extracción heurística de candidatos de negocio ────────────────────────
+# Tokens que se descartan al evaluar si un fragmento es un candidato negocio.
+# Refleja stop-tokens + días + artículos típicos del español rioplatense.
+_NEGOCIO_STOP_TOKENS: frozenset[str] = frozenset({
+    "el", "la", "los", "las", "un", "una", "de", "del", "en",
+    "y", "e", "o", "a", "al", "con", "por", "para", "mi",
+    "este", "esta", "hay", "hay", "tiene", "tienen",
+    "hoy", "manana", "ayer",
+    "lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo",
+})
+
+# Conjunto de todos los tokens de una sola palabra de categorías conocidas.
+# Se usa para distinguir "en carrefour" (negocio) de "en gastronomia" (cat).
+_ALL_CATEGORY_TOKENS: frozenset[str] = frozenset(
+    token
+    for keywords in _CATEGORY_KEYWORDS.values()
+    for token in keywords
+    if " " not in token
+)
+
+# Patrón: texto después de "en"/"para" que podría ser un nombre de comercio.
+# Captura hasta 4 palabras (máx. nombre comercial razonable).
+# Termina en fin de texto, coma, punto, o antes de palabras de corte.
+_NEGOCIO_CANDIDATE_RE = re.compile(
+    r"(?:^|\s)(?:en|para)\s+"
+    r"([a-zà-ɏ][a-zà-ɏ0-9]{1,25}"
+    r"(?:\s+[a-zà-ɏ0-9]{2,20}){0,3}?)"
+    r"(?=\s+(?:hoy|el|la|los|las|un|una|con|por|\d)|[,.]|\s*$)"
+)
+
+
+def _extract_negocio_candidate(text: str, tokens: set[str]) -> Optional[str]:
+    """
+    Extrae un candidato de negocio cuando no hay match en _KNOWN_NEGOCIOS.
+
+    Busca texto después de 'en' / 'para' que:
+      1. No sea un keyword de beneficio (_BENEFIT_KEYWORDS).
+      2. No sea una categoría conocida (_ALL_CATEGORY_TOKENS).
+      3. Tenga al menos 1 token no-stopword con longitud >= 3.
+
+    El candidato NO está validado contra datos reales. El orquestador
+    lo pasa a resolve_negocio() (Business Index) para confirmarlo.
+    Si el índice no lo reconoce, el candidato multi-word se descarta
+    para evitar 0-resultados con un substring incorrecto.
+
+    Args:
+        text:   Texto normalizado de la query.
+        tokens: Set de tokens del texto normalizado.
+
+    Returns:
+        String candidato (lowercase, sin acentos) o None.
+    """
+    match = _NEGOCIO_CANDIDATE_RE.search(text)
+    if not match:
+        return None
+
+    candidate = match.group(1).strip()
+    candidate_tokens = set(candidate.split())
+
+    # Rechazar si todos los tokens son keywords conocidos (categoría o beneficio)
+    known_tokens = _ALL_CATEGORY_TOKENS | _BENEFIT_KEYWORDS | _NEGOCIO_STOP_TOKENS
+    useful_tokens = candidate_tokens - known_tokens
+    if not useful_tokens:
+        return None
+
+    # Al menos un token útil debe tener >= 3 caracteres (evita falsos como "es")
+    if not any(len(t) >= 3 for t in useful_tokens):
+        return None
+
+    return candidate
+
 # Lista ordenada: frases más específicas primero para evitar match parcial
 _WEEKDAYS = ["lunes", "martes", "miercoles", "jueves", "viernes"]
 _ALL_DAYS = _WEEKDAYS + ["sabado", "domingo"]
@@ -388,16 +459,24 @@ def fast_classify(query: str) -> Optional[Classification]:
             negocio = nombre
             break
 
+    # Si no hay negocio conocido, intentar extracción heurística.
+    # El candidato se valida en el orquestador contra el Business Index.
+    # Si el índice no lo confirma, se descarta para evitar 0-resultados.
+    if negocio is None:
+        negocio = _extract_negocio_candidate(text, tokens)
+
     # ── Categoría ─────────────────────────────────────────────────────
     categoria = _match_category(text, tokens)
 
     # ── Intent ────────────────────────────────────────────────────────
+    # Segmento solo ("soy black", "soy premium") no cuenta como señal de
+    # búsqueda — requiere al menos otra entidad para disparar benefits.
+    # El orquestador intercepta ese caso y pide clarificación.
     has_signal = (
         bool(_BENEFIT_KEYWORDS & tokens)
         or categoria is not None
         or negocio is not None
         or dias is not None
-        or segmento is not None
         or tipo_beneficio is not None
     )
 

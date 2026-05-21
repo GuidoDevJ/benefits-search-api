@@ -67,8 +67,9 @@ def _build_user_context_block(
     - Solicitar ubicación: al final, si no hay ciudad y no se preguntó aún.
     """
     hoy = datetime.now()
+    fecha = f"{_DIAS_ES[hoy.weekday()]} {hoy.strftime('%d/%m/%Y')}"
     lines: list[str] = [
-        f"- Fecha actual: {_DIAS_ES[hoy.weekday()]} {hoy.strftime('%d/%m/%Y')}",
+        f"- Fecha actual: {fecha}",
     ]
 
     # ── Perfil del cliente ────────────────────────────────────────────
@@ -123,13 +124,16 @@ def _build_user_context_block(
     # ── Recencia: última búsqueda (usuario recurrente) ────────────────
     last_cat = user_prefs.get("last_categoria")
     last_at = user_prefs.get("last_searched_at")
+    # Recencia solo aplica en conversaciones activas (< 30 min) y no en
+    # sesiones nuevas. Ventana corta evita sugerencias de sesiones previas
+    # de prueba o de días anteriores.
     if last_cat and last_at and not is_new_session:
         try:
             last_dt = datetime.fromisoformat(last_at)
             mins_ago = int(
                 (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
             )
-            if mins_ago < 120:
+            if mins_ago < 30:
                 lines.append(
                     f"- Hace {mins_ago} min buscó: {last_cat}. "
                     "Si la consulta es amplia, podés sugerirle continuar "
@@ -196,7 +200,6 @@ def _validate_tool_result(tool_result: dict) -> dict:
     if discarded > 0:
         print(f"[Benefits] {discarded} items descartados por validación")
         n = len(valid_items)
-        offset = result.get("offset", 0)
         result["data"] = valid_items
         result["mostrando"] = n
         result["total"] = n
@@ -206,12 +209,62 @@ def _validate_tool_result(tool_result: dict) -> dict:
     return result
 
 
+def _build_search_context_note(search_context: Optional[dict]) -> str:
+    """
+    Genera la nota de contexto de búsqueda para inyectar en la INSTRUCCIÓN.
+
+    Le indica al LLM exactamente qué buscó el usuario para que construya
+    el encabezado correcto sin inferir ni inventar categorías.
+
+    Casos:
+      - negocio solo  → "Encontré X beneficios en [negocio]:"
+      - categoría sola → "Encontré X beneficios en [categoría]:"
+      - ambos          → "Encontré X beneficios de [negocio]:"
+      - ninguno        → "Encontré X beneficios:" (genérico)
+    """
+    if not search_context:
+        return ""
+
+    negocio = (search_context.get("negocio") or "").strip()
+    categoria = (search_context.get("categoria_benefits") or "").strip()
+
+    if negocio and not categoria:
+        return (
+            f"\nCONTEXTO DE BÚSQUEDA: el usuario buscó por negocio "
+            f"'{negocio}'. "
+            f"Encabezado OBLIGATORIO: 'Encontré X beneficios en "
+            f"{negocio.title()}:'. "
+            "NO menciones ni inferras ninguna categoría que no "
+            "fue buscada."
+        )
+    if categoria and not negocio:
+        return (
+            f"\nCONTEXTO DE BÚSQUEDA: el usuario buscó por categoría "
+            f"'{categoria}'. "
+            f"Encabezado: 'Encontré X beneficios en {categoria}:'"
+        )
+    if negocio and categoria:
+        return (
+            f"\nCONTEXTO DE BÚSQUEDA: negocio='{negocio}', "
+            f"categoría='{categoria}'. "
+            f"Encabezado: 'Encontré X beneficios de "
+            f"{negocio.title()}:'. "
+            "NO agregues ni inferras otra categoría."
+        )
+    # búsqueda genérica sin negocio ni categoría
+    return (
+        "\nCONTEXTO DE BÚSQUEDA: búsqueda genérica sin negocio ni "
+        "categoría. Encabezado: 'Encontré X beneficios:'"
+    )
+
+
 def _build_system_prompt(
     base_system: str,
     user_ctx: str,
     tool_result: dict,
     has_benefits: bool,
     serializer,
+    search_context: Optional[dict] = None,
 ) -> str:
     """
     Ensambla el system prompt con orden fijo y validación de datos.
@@ -262,11 +315,48 @@ def _build_system_prompt(
         # Caso C: resultados válidos → validar estructura y formatear
         validated = _validate_tool_result(tool_result)
         n_shown = len(validated.get("data", []))
+
+        # Si los resultados provienen del fallback global (la zona del cliente
+        # no tenía el negocio), avisar al agente para que lo aclare.
+        global_fallback_note = ""
+        if tool_result.get("is_global_fallback"):
+            global_fallback_note = (
+                "\nIMPORTANTE: Estos resultados son a nivel NACIONAL. "
+                "La zona del cliente no tiene este comercio. "
+                "Aclaráselo: 'No encontré [negocio] en tu zona, "
+                "pero a nivel nacional están disponibles:'. "
+                "Usá el tono del segmento indicado."
+            )
+
+        search_ctx_note = _build_search_context_note(search_context)
+
+        # Instrucción de paginación explícita — más autoritativa que las
+        # reglas estáticas del prompt, que el LLM tiende a ignorar.
+        hay_mas = tool_result.get("hay_mas", False)
+        restantes = tool_result.get("restantes", 0)
+        if hay_mas:
+            pagination_note = (
+                f" Hay {restantes} beneficios adicionales sin mostrar. "
+                f"Al final de tu respuesta DEBÉS preguntar: "
+                f"'¿Querés que te liste los siguientes {restantes}?'"
+            )
+        else:
+            pagination_note = (
+                " Estos son TODOS los resultados disponibles — no hay más. "
+                "NO preguntes si quieren ver más resultados. "
+                "Si es pertinente, podés sugerir una categoría relacionada."
+            )
+
         result_block = (
             f"RESULTADOS DE BÚSQUEDA:\n{serializer.serialize(validated)}\n\n"
-            f"INSTRUCCIÓN: Hay exactamente {n_shown} beneficio(s) en el resultado. "
-            f"Usá ese número exacto al mencionarlos — nunca inventes ni redondees. "
-            "Formateá estos resultados para el usuario según las reglas del prompt."
+            f"INSTRUCCIÓN: Hay exactamente {n_shown} beneficio(s) en el "
+            f"resultado. Usá ese número exacto al mencionarlos — nunca "
+            f"inventes ni redondees."
+            f"{search_ctx_note}"
+            f"{pagination_note}"
+            f"{global_fallback_note} "
+            "Formateá estos resultados para el usuario según las reglas "
+            "del prompt."
         )
 
     sections.append(result_block)
@@ -336,6 +426,11 @@ def create_benefits_agent(llm: ChatBedrock):
         )
         segmento = classification.get("segmento")
         tipo_beneficio_raw = classification.get("tipo_beneficio")
+        # Provincia: mensaje actual > ciudad guardada en prefs (declarada antes)
+        provincia_query: Optional[str] = (
+            classification.get("provincia")
+            or user_prefs.get("ciudad")
+        )
         offset = context.get("offset", 0)
 
         # ── Construir Entities (toda la lógica, sin LLM) ──────────────
@@ -345,6 +440,7 @@ def create_benefits_agent(llm: ChatBedrock):
             negocio=negocio,
             segmento=segmento,
             tipo_beneficio=tipo_beneficio_raw,
+            provincia=provincia_query,
         )
 
         # ── Saludo (primera sesión + usuario identificado) ────────────
@@ -464,6 +560,10 @@ def create_benefits_agent(llm: ChatBedrock):
             },
             has_benefits=has_benefits,
             serializer=serializer,
+            search_context={
+                "negocio": negocio,
+                "categoria_benefits": categoria,
+            },
         )
 
         format_messages: list[BaseMessage] = [

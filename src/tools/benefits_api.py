@@ -93,6 +93,12 @@ def _normalize_provincia(name: str) -> str:
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
+def _normalize_b(text: str) -> str:
+    """Normaliza un nombre de comercio: minúsculas, sin acentos."""
+    nfkd = unicodedata.normalize("NFKD", text.lower())
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
 def _resolve_state_ids(provincia: Optional[str]) -> Optional[List[int]]:
     """
     Resuelve el/los state ID(s) de TeVaBien para la provincia del usuario.
@@ -130,17 +136,19 @@ class BenefitsAPIConfig(BaseModel):
 
 
 class BenefitsResponse(BaseModel):
-    success:    bool
-    data:       Optional[List[BenefitItem]] = None
-    error:      Optional[str] = None
-    url:        str
-    status_code: int
+    success:             bool
+    data:                Optional[List[BenefitItem]] = None
+    error:               Optional[str] = None
+    url:                 str
+    status_code:         int
+    # True cuando resultado regional=0 y se usó búsqueda global
+    is_global_fallback:  bool = False
 
 
 # ── Caché ────────────────────────────────────────────────────────────────
 
-CACHE_TTL_ALL_BENEFITS = 86400   # 24 h — beneficios crudos de la API
-CACHE_TTL_SEARCH_RESULTS = 3600  #  1 h — resultados filtrados/ordenados
+CACHE_TTL_ALL_BENEFITS = 86400    # 24 h — beneficios crudos de la API
+CACHE_TTL_SEARCH_RESULTS = 3600   # 1 h — resultados filtrados/ordenados
 PAGE_SIZE = 5
 
 
@@ -165,7 +173,7 @@ def _build_search_cache_key(
         "neg": entities.negocio,
         "seg": entities.segmento,
         "tipo": entities.tipo_beneficio,
-        "prov": profile.get("provincia"),
+        "prov": entities.provincia or profile.get("provincia"),
         "prods": sorted(
             str(p) for p in (profile.get("productos") or [])
         ),
@@ -237,7 +245,9 @@ async def _get_cached_for_state(
         return cached_data
 
     print(f"[Cache] MISS: {cache_key} — llamando API...")
-    data = await _fetch_all_benefits_from_api(config, headers, timeout, state_id)
+    data = await _fetch_all_benefits_from_api(
+        config, headers, timeout, state_id
+    )
 
     try:
         if data:
@@ -340,16 +350,44 @@ def _apply_filters(data: List[dict], params: dict) -> List[dict]:
         ]
         print(f"[Filter] days={days} -> {len(filtered)} beneficios")
 
-    # 3. Negocio: substring case-insensitive en nombre del comercio
+    # 3. Negocio: substring case-insensitive en nombre del comercio.
+    #    Fallback token-overlap: si el substring exacto da 0 resultados,
+    #    se intenta coincidencia por tokens para cubrir variaciones del nombre.
+    #    Ej: negocio="mostaza belgrano" → substring falla si b="MOSTAZA SRL",
+    #        pero token "mostaza" sí aparece → fallback encuentra el item.
+    _NEGOCIO_STOP = frozenset({
+        "el", "la", "los", "las", "de", "del", "en", "y", "un", "una",
+    })
     negocio = params.get("negocio")
     if negocio:
-        filtered = [
+        negocio_lower = negocio.lower()
+        substring_results = [
             item for item in filtered
-            if negocio.lower() in item.get("b", "").lower()
+            if negocio_lower in item.get("b", "").lower()
         ]
-        print(
-            f"[Filter] negocio='{negocio}' -> {len(filtered)} beneficios"
-        )
+        if substring_results:
+            filtered = substring_results
+            print(
+                f"[Filter] negocio='{negocio}' -> {len(filtered)} beneficios"
+            )
+        else:
+            # Fallback: token-overlap sobre dataset antes del filtro de negocio
+            negocio_tokens = {
+                t for t in negocio_lower.split()
+                if t not in _NEGOCIO_STOP and len(t) >= 3
+            }
+            if negocio_tokens:
+                token_results = [
+                    item for item in filtered
+                    if negocio_tokens & set(
+                        _normalize_b(item.get("b", "")).split()
+                    )
+                ]
+                filtered = token_results
+                print(
+                    f"[Filter] negocio='{negocio}' token-overlap "
+                    f"(tokens={negocio_tokens}) -> {len(filtered)} beneficios"
+                )
 
     # 4. Productos del usuario: o[] vacío (universal) o intersección
     product_ids = params.get("product_ids", [])
@@ -502,8 +540,8 @@ async def fetch_benefits(
     filter_params = build_filter_params(entities, user_profile)
     print(f"[Benefits] filter_params={filter_params}")
 
-    # Resolver state IDs a partir de la provincia del perfil
-    provincia = (user_profile or {}).get("provincia")
+    # Resolver state IDs: provincia en entities (mensaje/prefs) > perfil bancario
+    provincia = entities.provincia or (user_profile or {}).get("provincia")
     state_ids = _resolve_state_ids(provincia)
     if provincia:
         label = (
@@ -537,11 +575,50 @@ async def fetch_benefits(
             f"{len(sorted_data)} ordenados"
         )
 
+        # ── Geo-fallback ─────────────────────────────────────────────────
+        # Si la búsqueda regional devuelve 0 resultados Y había un filtro
+        # de negocio explícito, reintentamos a nivel global (sin state_ids).
+        #
+        # Razonamiento: para categorías generales (gastronomía, moda) no
+        # tiene sentido mostrar comercios de otras provincias al usuario.
+        # Pero para un negocio específico ("Mostaza"), el cliente quiere
+        # saber si existe el beneficio aunque no sea en su zona.
+        #
+        # El flag is_global_fallback=True llega al agente para que aclare
+        # "no está en tu zona, pero a nivel nacional...".
+        is_global_fallback = False
+        if (
+            len(sorted_data) == 0
+            and filter_params.get("negocio")
+            and state_ids is not None   # solo si se aplicó filtro geográfico
+        ):
+            print(
+                f"[Benefits] Geo-fallback: 0 resultados en zona para "
+                f"negocio='{filter_params['negocio']}' → retry global"
+            )
+            global_benefits = await _get_all_benefits_cached(
+                config, headers, timeout, state_ids=None
+            )
+            if global_benefits:
+                filtered_global = _apply_filters(
+                    global_benefits, filter_params
+                )
+                sorted_data = _sort_by_discount(
+                    _prioritize(filtered_global, filter_params)
+                )
+                if sorted_data:
+                    is_global_fallback = True
+                    print(
+                        f"[Benefits] Geo-fallback: {len(sorted_data)} "
+                        "resultados globales encontrados"
+                    )
+
         return BenefitsResponse(
             success=True,
             data=sorted_data,
             url="(from-daily-cache)",
             status_code=200,
+            is_global_fallback=is_global_fallback,
         )
 
     except Exception as e:
@@ -636,8 +713,11 @@ async def search_benefits_with_profile(
     )
 
     # ── Intento de caché ──────────────────────────────────────────────
+    # El cache almacena {"items": [...], "global_fallback": bool} para
+    # preservar el flag de geo-fallback entre requests del mismo usuario.
     cache_key = _build_search_cache_key(entities, user_profile)
     all_normalized: Optional[List[dict]] = None
+    is_global_fallback: bool = False
     api_error: Optional[str] = None
 
     if CACHE_ENABLED:
@@ -645,11 +725,17 @@ async def search_benefits_with_profile(
             cache = await get_cache_service()
             cached = await cache.get(cache_key)
             if cached is not None:
+                # Soporte para ambos formatos: dict nuevo y lista legacy
+                if isinstance(cached, dict) and "items" in cached:
+                    all_normalized = cached["items"]
+                    is_global_fallback = cached.get("global_fallback", False)
+                elif isinstance(cached, list):
+                    all_normalized = cached
                 print(
                     f"[Cache] HIT search: {cache_key[-12:]} "
-                    f"({len(cached)} items)"
+                    f"({len(all_normalized)} items, "
+                    f"global_fallback={is_global_fallback})"
                 )
-                all_normalized = cached
         except Exception as ce:
             print(f"[Cache] Error leyendo search cache: {ce}")
 
@@ -664,6 +750,7 @@ async def search_benefits_with_profile(
         all_normalized = [
             normalize_promo(b.model_dump()) for b in all_data
         ]
+        is_global_fallback = response.is_global_fallback
         api_error = response.error
 
         if CACHE_ENABLED and all_normalized:
@@ -671,12 +758,13 @@ async def search_benefits_with_profile(
                 cache = await get_cache_service()
                 await cache.set(
                     cache_key,
-                    all_normalized,
+                    {"items": all_normalized, "global_fallback": is_global_fallback},
                     ttl=CACHE_TTL_SEARCH_RESULTS,
                 )
                 print(
                     f"[Cache] SET search: {cache_key[-12:]} "
-                    f"({len(all_normalized)} items, TTL=1h)"
+                    f"({len(all_normalized)} items, TTL=1h, "
+                    f"global_fallback={is_global_fallback})"
                 )
             except Exception as ce:
                 print(f"[Cache] Error guardando search cache: {ce}")
@@ -693,6 +781,7 @@ async def search_benefits_with_profile(
         "mostrando": mostrando,
         "restantes": restantes,
         "hay_mas": restantes > 0,
+        "is_global_fallback": is_global_fallback,
     }
     if api_error:
         result["error"] = api_error

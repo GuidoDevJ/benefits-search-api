@@ -107,11 +107,12 @@ def _needs_clarification(
     if has_categoria or has_tipo:
         return False, ""
 
+    # Provincia explícita + intent benefits = contexto suficiente.
+    # Buscar directamente los beneficios del área sin pedir categoría.
     provincia = merged.get("provincia")
-    prefix = (
-        "Los beneficios Comafi aplican en todo el país. "
-        if provincia else ""
-    )
+    if provincia:
+        return False, ""
+
     known_dias = merged.get("dias") or (
         [merged["dia"]] if merged.get("dia") else None
     )
@@ -119,13 +120,13 @@ def _needs_clarification(
     if known_dias:
         dias_str = _format_dias(known_dias)
         return True, (
-            f"{prefix}¿Qué tipo de beneficio buscás para {dias_str}?\n\n"
+            f"¿Qué tipo de beneficio buscás para {dias_str}?\n\n"
             "Por ejemplo: gastronomía, supermercados, moda, "
             "entretenimiento, combustible, turismo, cine, salud, belleza..."
         )
 
     return True, (
-        f"{prefix}¿Qué tipo de comercio te interesa y para cuándo?\n\n"
+        "¿Qué tipo de comercio te interesa y para cuándo?\n\n"
         "Por ejemplo: _gastronomía los sábados_, "
         "_supermercados los lunes_, _cine este fin de semana_..."
     )

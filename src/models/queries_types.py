@@ -275,19 +275,28 @@ TRADE_ALIASES: dict[str, str] = {
 # ── SEGMENT_ALIASES ──────────────────────────────────────────────────────────
 # Normaliza "segmento" de sofia-api-users -> clave en CHANNELS.
 SEGMENT_ALIASES: dict[str, str] = {
-    "unico black":        "black",
-    "comafi black":       "black",
-    "black":              "black",
-    "premium platinum":   "premium_platinum",
-    "premium":            "premium",
-    "plan sueldo":        "plan_sueldo",
-    "sueldo":             "plan_sueldo",
-    "pyme":               "pyme",
-    "negocios":           "pyme",
-    "negocios y pyme":    "pyme",
-    "masivo":             "standard",
-    "standard":           "standard",
-    "classico":           "standard",
+    # Black — con y sin prefijo "COMAFI"
+    "unico black":              "black",
+    "comafi unico black":       "black",
+    "comafi black":             "black",
+    "black":                    "black",
+    # Premium Platinum — con y sin prefijo "COMAFI"
+    "premium platinum":         "premium_platinum",
+    "comafi premium platinum":  "premium_platinum",
+    # Premium — con y sin prefijo "COMAFI"
+    "premium":                  "premium",
+    "comafi premium":           "premium",
+    # Plan Sueldo
+    "plan sueldo":              "plan_sueldo",
+    "sueldo":                   "plan_sueldo",
+    # PyME
+    "pyme":                     "pyme",
+    "negocios":                 "pyme",
+    "negocios y pyme":          "pyme",
+    # Standard / masivo
+    "masivo":                   "standard",
+    "standard":                 "standard",
+    "classico":                 "standard",
 }
 
 # ── PRODUCT_NAME_ALIASES ─────────────────────────────────────────────────────

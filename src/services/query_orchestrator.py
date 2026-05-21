@@ -71,7 +71,74 @@ def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# ── Detección de consultas de ayuda/capacidades ───────────────────────────
+
+_HELP_PHRASES = frozenset(
+    {
+        "con que me podes ayudar",
+        "con que me podras ayudar",
+        "con que me puedes ayudar",
+        "en que me ayudas",
+        "en que me podes ayudar",
+        "en que me puedes ayudar",
+        "que podes hacer",
+        "que podras hacer",
+        "que puedes hacer",
+        "que haces",
+        "que hacen",
+        "para que sirves",
+        "para que sirve",
+        "ayuda",
+        "help",
+        "menu",
+        "opciones",
+        "que ofrecen",
+        "que ofreces",
+        "que me podes ofrecer",
+        "que me puedes ofrecer",
+        "como funciona",
+        "que es esto",
+        "que podes mostrarme",
+        "que podes mostrar",
+        "que tipos de beneficios hay",
+        "que beneficios hay",
+        "que opciones hay",
+        "que consultas puedo hacer",
+        "sobre que me podes ayudar",
+        "sobre que me puedes ayudar",
+    }
+)
+
+_CAPABILITIES_RESPONSE = (
+    "Puedo ayudarte a encontrar descuentos y beneficios. "
+    "Algunas cosas que podés consultarme:\n"
+    "• Descuentos por categoría: gastronomía, supermercados, combustible, "
+    "moda, cine, salud y más\n"
+    "• Beneficios para días específicos (ej: 'descuentos los jueves')\n"
+    "• Beneficios en comercios concretos (ej: 'promos en Carrefour')\n"
+    "• Cuotas sin interés disponibles\n"
+    "• Beneficios por zona o ciudad\n\n"
+    "¿Sobre qué querés consultar?"
+)
+
+_UNKNOWN_RESPONSE = (
+    "Solo puedo ayudarte con descuentos y beneficios de tu tarjeta Comafi. "
+    "Podés preguntarme sobre:\n"
+    "• Gastronomía, supermercados, combustible, moda, cine y más\n"
+    "• Beneficios para días específicos o comercios concretos"
+)
+
+
+def _is_help_query(query: str) -> bool:
+    """Detecta si la consulta es una pregunta sobre capacidades del agente."""
+    normalized = _normalize_text(query)
+    return normalized in _HELP_PHRASES or any(
+        phrase in normalized for phrase in _HELP_PHRASES if len(phrase) > 8
+    )
+
+
 # ── Recuperación de contexto desde historial ─────────────────────────────
+
 
 def _recover_classification_from_history(history: list) -> Optional[dict]:
     """
@@ -87,11 +154,13 @@ def _recover_classification_from_history(history: list) -> Optional[dict]:
     """
     try:
         from ..tools.fast_classifier import (
-            fast_classify, _VER_MAS_AFFIRMATIVES,
+            fast_classify,
+            _VER_MAS_AFFIRMATIVES,
         )
     except ImportError:
         from src.tools.fast_classifier import (
-            fast_classify, _VER_MAS_AFFIRMATIVES,
+            fast_classify,
+            _VER_MAS_AFFIRMATIVES,
         )
 
     for msg in reversed(history):
@@ -99,11 +168,7 @@ def _recover_classification_from_history(history: list) -> Optional[dict]:
             continue
         normalized = _normalize_text(msg.content)
         tokens = set(normalized.split())
-        if (
-            not tokens
-            or tokens.issubset(_VER_MAS_AFFIRMATIVES)
-            or len(normalized) <= 2
-        ):
+        if not tokens or tokens.issubset(_VER_MAS_AFFIRMATIVES) or len(normalized) <= 2:
             continue
         clf = fast_classify(msg.content)
         if clf and clf.intent == "benefits":
@@ -134,6 +199,7 @@ def _count_benefits_pages_in_history(history: list) -> int:
 
 
 # ── Rescate de gathering activo ───────────────────────────────────────────
+
 
 def _rescue_gathering_response(
     query: str,
@@ -177,18 +243,23 @@ def _rescue_gathering_response(
         intent="benefits",
         categoria_benefits=clf.categoria_benefits,
         negocio=clf.negocio,
-        segmento=clf.segmento,
+        segmento=clf.segmento or gathering_ctx.get("segmento"),
         tipo_beneficio=clf.tipo_beneficio,
         provincia=clf.provincia or gathering_ctx.get("provincia"),
         dias=clf.dias or inherited_dias,
         dia=(
             clf.dia
-            or (inherited_dias[0] if inherited_dias and len(inherited_dias) == 1 else None)
+            or (
+                inherited_dias[0]
+                if inherited_dias and len(inherited_dias) == 1
+                else None
+            )
         ),
     )
 
 
 # ── Resultado del orquestador ─────────────────────────────────────────────
+
 
 @dataclass
 class OrchestratorResult:
@@ -204,6 +275,7 @@ class OrchestratorResult:
                         (location, unknown, ver_mas sin contexto).
         total_ms:       Latencia total en milisegundos.
     """
+
     response: str
     session_id: str
     user_profile: Optional[dict] = None
@@ -213,6 +285,7 @@ class OrchestratorResult:
 
 
 # ── Orquestador ───────────────────────────────────────────────────────────
+
 
 class QueryOrchestrator:
     """
@@ -258,6 +331,29 @@ class QueryOrchestrator:
 
         t_start = time.monotonic()
 
+        # ── 0. Consultas de ayuda/capacidades (salida sin LLM ni Redis) ────
+        if _is_help_query(query):
+            total_ms = int((time.monotonic() - t_start) * 1000)
+            if audit_service:
+                await audit_service.record_user_input(
+                    session_id=session_id,
+                    model_id=BEDROCK_MODEL_ID,
+                    query=query,
+                    nlp_result={"intent": "help"},
+                )
+                await audit_service.record_final_response(
+                    session_id=session_id,
+                    model_id=BEDROCK_MODEL_ID,
+                    response=_CAPABILITIES_RESPONSE,
+                    total_latency_ms=total_ms,
+                )
+            return OrchestratorResult(
+                response=_CAPABILITIES_RESPONSE,
+                session_id=session_id,
+                is_early_exit=True,
+                total_ms=total_ms,
+            )
+
         # ── 1+2. Clasificación rápida + validación ────────────────────────
         # fast_classify corre PRIMERO: si reconoce la consulta (incluyendo
         # afirmativos cortos como "si", "dale", "ok" → ver_mas), es válida
@@ -273,12 +369,7 @@ class QueryOrchestrator:
         if classification is None:
             # fast_classify no lo reconoció — validar antes de gastar tokens
             if not query or not query.strip() or not is_valid_query(query):
-                resp = (
-                    "No pude entender tu consulta. "
-                    "Podés preguntarme sobre:\n"
-                    "• Descuentos y beneficios: gastronomía, supermercados, "
-                    "entretenimiento, etc."
-                )
+                resp = _UNKNOWN_RESPONSE
                 if audit_service:
                     await audit_service.record_user_input(
                         session_id=session_id,
@@ -290,9 +381,7 @@ class QueryOrchestrator:
                         session_id=session_id,
                         model_id=BEDROCK_MODEL_ID,
                         response=resp,
-                        total_latency_ms=int(
-                            (time.monotonic() - t_start) * 1000
-                        ),
+                        total_latency_ms=int((time.monotonic() - t_start) * 1000),
                     )
                 return OrchestratorResult(
                     response=resp,
@@ -318,6 +407,7 @@ class QueryOrchestrator:
         if phone:
             try:
                 from ..memory import get_prefs_service
+
                 prefs_svc = await get_prefs_service()
                 user_prefs = await prefs_svc.load(phone)
             except Exception as exc:
@@ -333,9 +423,129 @@ class QueryOrchestrator:
             except Exception:
                 pass
 
+        # ── 3c. Segmento sin señal de beneficio → clarificación ─────────────
+        # Caso: "soy black", "cliente premium" — solo se identifica el segmento
+        # sin pedir beneficios concretos. Se pide qué categoría busca.
+        #
+        # NO aplica si la query tiene keywords explícitas de beneficio:
+        # "beneficios de comafi black" → tiene "beneficios" → flujo normal.
+        # Solo aplica para identificaciones puras: "soy black", "cliente premium".
+        from ..tools.fast_classifier import _BENEFIT_KEYWORDS
+        _query_tokens = set(_normalize_text(query).split())
+        _query_has_benefit_kw = bool(_BENEFIT_KEYWORDS & _query_tokens)
+
+        if (
+            classification.intent == "benefits"
+            and classification_dict.get("segmento")
+            and not classification_dict.get("categoria_benefits")
+            and not classification_dict.get("negocio")
+            and not classification_dict.get("dias")
+            and not classification_dict.get("tipo_beneficio")
+            and not _query_has_benefit_kw
+        ):
+            seg = classification_dict["segmento"]
+            seg_display = seg.replace("_", " ").title()
+            if "sueldo" in seg:
+                seg_display = "Plan Sueldo"
+
+            if phone and prefs_svc:
+                try:
+                    await prefs_svc.save_search_context(
+                        phone,
+                        {"segmento": seg, "intent": "benefits"},
+                        gathering=True,
+                    )
+                except Exception:
+                    pass
+
+            # No afirmar el segmento del usuario — el perfil no está cargado aún.
+            # Solo preguntar qué busca, mencionando el segmento como contexto.
+            if "black" in seg:
+                resp = (
+                    f"¿Qué tipo de beneficios {seg_display} querés explorar? "
+                    "Podés pedirme gastronomía, turismo, moda, combustible y más."
+                )
+            elif "premium" in seg or "platinum" in seg:
+                resp = (
+                    f"¿Qué beneficios {seg_display} querés ver? "
+                    "Tenés descuentos en gastronomía, moda, salud, viajes y más."
+                )
+            else:
+                resp = (
+                    f"¿Qué tipo de beneficios {seg_display} estás buscando? "
+                    "Podés pedirme gastronomía, supermercados, combustible, moda y más."
+                )
+
+            total_ms = int((time.monotonic() - t_start) * 1000)
+            if audit_service:
+                await audit_service.record_final_response(
+                    session_id=session_id,
+                    model_id=BEDROCK_MODEL_ID,
+                    response=resp,
+                    total_latency_ms=total_ms,
+                )
+            return OrchestratorResult(
+                response=resp,
+                session_id=session_id,
+                user_prefs=user_prefs,
+                is_early_exit=True,
+                total_ms=total_ms,
+            )
+
+        # ── 3.5 Resolver negocio vía Business Index ──────────────────────────
+        # fast_classify puede haber extraído un candidato heurístico en
+        # classification.negocio (texto después de "en"/"para" no reconocido
+        # como negocio conocido). Lo validamos contra el índice invertido.
+        #
+        # Lógica:
+        #   - Si el índice confirma el token → se usa como substring filter.
+        #   - Si el índice no lo encuentra Y el candidato es multi-word o largo
+        #     (> 15 chars) → se descarta. Un negocio conocido como "ypf" o
+        #     "carrefour" pasa siempre (vienen de _KNOWN_NEGOCIOS, no de aquí).
+        #   - El check "classification.negocio not in _KNOWN_NEGOCIOS" permite
+        #     identificar si el valor fue puesto por la heurística.
+        if classification.intent == "benefits" and classification.negocio:
+            try:
+                from ..tools.fast_classifier import _KNOWN_NEGOCIOS
+                from ..tools.business_index import resolve_negocio
+                from ..tools.llm_classifier import Classification as _Clf
+
+                _is_heuristic_candidate = (
+                    classification.negocio not in _KNOWN_NEGOCIOS.values()
+                )
+                if _is_heuristic_candidate:
+                    resolved = await resolve_negocio(classification.negocio)
+                    if resolved:
+                        print(
+                            f"{log_prefix} [BizIndex] "
+                            f"'{classification.negocio}' → '{resolved}'"
+                        )
+                        classification = _Clf(
+                            **{**classification_dict, "negocio": resolved}
+                        )
+                        classification_dict = classification.model_dump()
+                    else:
+                        # Candidato heurístico no confirmado en el índice.
+                        # Descartamos multi-word o strings largos; los cortos
+                        # (p.ej. nombre de 1 sola palabra corta) se dejan pasar
+                        # porque el substring match puede funcionar igual.
+                        _candidate = classification.negocio
+                        if " " in _candidate or len(_candidate) > 15:
+                            print(
+                                f"{log_prefix} [BizIndex] candidato "
+                                f"'{_candidate}' no confirmado → descartado"
+                            )
+                            classification = _Clf(
+                                **{**classification_dict, "negocio": None}
+                            )
+                            classification_dict = classification.model_dump()
+            except Exception as _biz_exc:
+                print(f"{log_prefix} [BizIndex] error en resolución: {_biz_exc}")
+
         # ── 4. intent="location" → guardar ciudad, salida temprana ───────
         if classification.intent == "location" and classification.provincia:
             from ..models.queries_types import PROVINCES
+
             pkey = classification.provincia
             display = PROVINCES.get(pkey, pkey.title())
             if prefs_svc and phone:
@@ -388,12 +598,7 @@ class QueryOrchestrator:
                     await on_unknown_query(query)
                 except Exception as exc:
                     print(f"{log_prefix} Error en on_unknown_query: {exc}")
-            resp = (
-                "No puedo ayudarte con eso. "
-                "Podés preguntarme sobre:\n"
-                "• Descuentos y beneficios: gastronomía, supermercados, "
-                "entretenimiento, etc."
-            )
+            resp = _UNKNOWN_RESPONSE
             total_ms = int((time.monotonic() - t_start) * 1000)
             if audit_service:
                 await audit_service.record_final_response(
@@ -410,9 +615,14 @@ class QueryOrchestrator:
             )
 
         # ── 6. Persistir provincia inline (query mixta beneficio+zona) ───
-        if phone and prefs_svc and classification.provincia \
-                and not user_prefs.get("ciudad"):
+        if (
+            phone
+            and prefs_svc
+            and classification.provincia
+            and not user_prefs.get("ciudad")
+        ):
             from ..models.queries_types import PROVINCES
+
             pkey = classification.provincia
             display = PROVINCES.get(pkey, pkey.title())
             try:
@@ -427,6 +637,7 @@ class QueryOrchestrator:
         if phone and MEMORY_ENABLED:
             try:
                 from ..memory import get_memory_service
+
                 memory_svc = await get_memory_service()
                 history = await memory_svc.load_history(phone)
             except Exception as exc:
@@ -446,12 +657,10 @@ class QueryOrchestrator:
         if phone and USER_IDENTIFICATION_ENABLED:
             try:
                 from ..tools.user_profile import fetch_user_profile
+
                 profile = await fetch_user_profile(phone)
                 user_profile_dict = profile.model_dump()
-                status = (
-                    "identificado" if profile.identificado
-                    else "no identificado"
-                )
+                status = "identificado" if profile.identificado else "no identificado"
                 print(
                     f"{log_prefix} session={session_id[:8]} "
                     f"usuario={status} ({phone[-4:]})"
@@ -473,7 +682,8 @@ class QueryOrchestrator:
                 # ── Caso normal: search_context fresco en Redis ───────────
                 page = search_context.get("page", 1) + 1
                 merged_clf = {
-                    k: v for k, v in search_context.items()
+                    k: v
+                    for k, v in search_context.items()
                     if k not in ("gathering", "page")
                 }
                 merged_clf["intent"] = "benefits"
@@ -561,9 +771,7 @@ class QueryOrchestrator:
                             total_ms=total_ms,
                         )
         else:
-            gathering = (
-                search_context if search_context.get("gathering") else {}
-            )
+            gathering = search_context if search_context.get("gathering") else {}
 
             # Soft-hint: si la búsqueda anterior tenía categoría y la nueva
             # clasificación no detectó ninguna (ej: "ofertas en combustibles"
@@ -648,17 +856,19 @@ class QueryOrchestrator:
 
         # ── 12. Invocar grafo ─────────────────────────────────────────────
         messages = history + [HumanMessage(content=query)]
-        result = await get_graph().ainvoke({
-            "messages":      messages,
-            "next":          "",
-            "context":       graph_context,
-            "session_id":    session_id,
-            "audit_service": audit_service,
-            "phone_number":  phone,
-            "user_profile":  user_profile_dict,
-            "user_prefs":    user_prefs,
-            "is_new_session": is_new_session,
-        })
+        result = await get_graph().ainvoke(
+            {
+                "messages": messages,
+                "next": "",
+                "context": graph_context,
+                "session_id": session_id,
+                "audit_service": audit_service,
+                "phone_number": phone,
+                "user_profile": user_profile_dict,
+                "user_prefs": user_prefs,
+                "is_new_session": is_new_session,
+            }
+        )
 
         # Extraer texto de la respuesta del grafo
         response_content = _extract_response(result)
@@ -678,6 +888,7 @@ class QueryOrchestrator:
         if phone and MEMORY_ENABLED:
             try:
                 from ..memory import get_memory_service
+
                 memory_svc = await get_memory_service()
                 await memory_svc.save_messages(
                     phone,
@@ -713,9 +924,7 @@ def _extract_response(result: dict) -> str:
             if isinstance(final_message.content, str):
                 return final_message.content
             elif isinstance(final_message.content, dict):
-                return final_message.content.get(
-                    "message", str(final_message.content)
-                )
+                return final_message.content.get("message", str(final_message.content))
             return str(final_message.content)
         return str(final_message)
     except Exception as exc:

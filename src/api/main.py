@@ -51,10 +51,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# ── Gradio montado en /chat y /audit-ui ──────────────────────────────────────
-app = gr.mount_gradio_app(app, create_chat_interface(), path="/chat")
-app = gr.mount_gradio_app(app, create_audit_interface(), path="/audit-ui")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -125,6 +121,46 @@ async def clear_user_memory(req: ClearMemoryRequest):
     })
 
 
+@app.delete("/business-index")
+async def delete_business_index():
+    """Elimina el índice de negocios del caché.
+
+    Invocar antes de POST /sync/business-index para forzar una reconstrucción.
+    """
+    from ..cache import get_cache_service
+    from ..tools.business_index import BUSINESS_INDEX_CACHE_KEY
+
+    cache = await get_cache_service()
+    deleted = await cache.delete(BUSINESS_INDEX_CACHE_KEY)
+    return JSONResponse(content={
+        "ok": deleted,
+        "message": "Índice eliminado." if deleted else "El índice no existía.",
+    })
+
+
+@app.post("/sync/business-index")
+async def sync_business_index():
+    """
+    Reconstruye el índice invertido de nombres de comercios.
+
+    Lee all_benefits desde Redis (cache diario) o llama a la API si el
+    cache está vacío. Guarda el índice en Redis (TTL 24h).
+
+    Invocar una vez al día, idealmente después de que el cache de
+    all_benefits se haya actualizado (prime time nocturno o madrugada).
+    """
+    try:
+        from ..tools.business_index import build_and_sync
+        count = await build_and_sync()
+        return JSONResponse(content={
+            "ok": True,
+            "indexed": count,
+            "message": f"{count} negocios indexados correctamente",
+        })
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @app.post("/benefits")
 async def get_benefits(query: QueryRequest):
     """Endpoint principal de búsqueda de beneficios."""
@@ -178,3 +214,8 @@ async def get_benefits(query: QueryRequest):
             },
             status_code=500,
         )
+
+
+# ── Gradio montado al final para no interferir con las rutas FastAPI ─────────
+app = gr.mount_gradio_app(app, create_chat_interface(), path="/chat")
+app = gr.mount_gradio_app(app, create_audit_interface(), path="/audit-ui")

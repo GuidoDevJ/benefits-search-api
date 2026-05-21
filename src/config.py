@@ -60,6 +60,13 @@ CW_RETENTION_DAYS = int(os.getenv("CW_RETENTION_DAYS", "90"))
 BEDROCK_GUARDRAIL_ID = os.getenv("BEDROCK_GUARDRAIL_ID", "")
 BEDROCK_GUARDRAIL_VERSION = os.getenv("BEDROCK_GUARDRAIL_VERSION", "DRAFT")
 
+# Bedrock Prompt Management — IDs de prompts gestionados en AWS Bedrock
+# Pueden ser ARN completo o sólo el ID del prompt.
+BEDROCK_PROMPT_BENEFITS_ID = os.getenv("BEDROCK_PROMPT_BENEFITS_ID", "")
+BEDROCK_PROMPT_TIENDA_ID = os.getenv("BEDROCK_PROMPT_TIENDA_ID", "")
+# Versión a usar en todos los prompts: número de versión (ej: "1") o "DRAFT"
+BEDROCK_PROMPT_VERSION = os.getenv("BEDROCK_PROMPT_VERSION", "DRAFT")
+
 # Validaciones
 # En ECS con task role, boto3 obtiene credenciales vía metadata endpoint;
 # no se necesitan claves estáticas.
