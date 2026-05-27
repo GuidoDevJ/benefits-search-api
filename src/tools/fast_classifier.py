@@ -247,11 +247,12 @@ _ALL_CATEGORY_TOKENS: frozenset[str] = frozenset(
     if " " not in token
 )
 
-# Patrón: texto después de "en"/"para" que podría ser un nombre de comercio.
+# Patrón: texto después de "en"/"para"/"sobre" que podría ser un negocio.
+# "sobre" cubre "quiero saber mas sobre Kansas", "info sobre Freddo", etc.
 # Captura hasta 4 palabras (máx. nombre comercial razonable).
 # Termina en fin de texto, coma, punto, o antes de palabras de corte.
 _NEGOCIO_CANDIDATE_RE = re.compile(
-    r"(?:^|\s)(?:en|para)\s+"
+    r"(?:^|\s)(?:en|para|sobre)\s+"
     r"([a-zà-ɏ][a-zà-ɏ0-9]{1,25}"
     r"(?:\s+[a-zà-ɏ0-9]{2,20}){0,3}?)"
     r"(?=\s+(?:hoy|el|la|los|las|un|una|con|por|\d)|[,.]|\s*$)"

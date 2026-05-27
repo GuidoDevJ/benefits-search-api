@@ -325,6 +325,20 @@ PRODUCT_NAME_ALIASES: dict[str, str] = {
 }
 
 
+# ── SEGMENT_RANK ─────────────────────────────────────────────────────────────
+# Jerarquía de segmentos: mayor número = mayor nivel de acceso.
+# Usado para detectar cuando un usuario pide beneficios de un segmento
+# al que no pertenece (ej: cliente premium consultando beneficios black).
+SEGMENT_RANK: dict[str, int] = {
+    "standard":         0,
+    "plan_sueldo":      1,
+    "pyme":             1,
+    "premium":          2,
+    "premium_platinum": 3,
+    "black":            4,
+}
+
+
 def resolve_trade_ids(categoria: str) -> list[int]:
     """
     Resuelve una categoría (texto libre o clave) a su lista de IDs de trade.

@@ -20,7 +20,9 @@ class AgentState(TypedDict):
     phone_number: Optional[str]   # Número de WhatsApp del usuario
     user_profile: Optional[dict]  # Perfil obtenido de sofia-api-users
     user_prefs:   Optional[dict]  # Preferencias persistentes (ciudad, etc.)
-    is_new_session: bool          # True si es la primera consulta de esta sesión
+    is_new_session: bool   # True si es la primera consulta de esta sesión
+    # Contexto unificado (producido por user_profile_agent_node)
+    user_context: Optional[Any]  # UserContext (Any evita import circular)
 
 
 def messages_to_dict(messages: list[BaseMessage]) -> list[dict]:

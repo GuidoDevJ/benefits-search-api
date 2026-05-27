@@ -576,25 +576,31 @@ async def fetch_benefits(
         )
 
         # ── Geo-fallback ─────────────────────────────────────────────────
-        # Si la búsqueda regional devuelve 0 resultados Y había un filtro
-        # de negocio explícito, reintentamos a nivel global (sin state_ids).
-        #
-        # Razonamiento: para categorías generales (gastronomía, moda) no
-        # tiene sentido mostrar comercios de otras provincias al usuario.
-        # Pero para un negocio específico ("Mostaza"), el cliente quiere
-        # saber si existe el beneficio aunque no sea en su zona.
+        # Si la búsqueda regional devuelve 0 resultados, reintentamos a
+        # nivel global para:
+        #   - Negocio específico: el cliente quiere saber si existe el
+        #     beneficio aunque no esté en su zona.
+        #   - Categoría: si no hay beneficios para esa categoría en la
+        #     provincia, mostrar los nacionales es mejor que 0 resultados.
         #
         # El flag is_global_fallback=True llega al agente para que aclare
         # "no está en tu zona, pero a nivel nacional...".
         is_global_fallback = False
+        _has_negocio = filter_params.get("negocio")
+        _has_categoria = bool(filter_params.get("trade_ids"))
         if (
             len(sorted_data) == 0
-            and filter_params.get("negocio")
             and state_ids is not None   # solo si se aplicó filtro geográfico
+            and (_has_negocio or _has_categoria)
         ):
+            _what = (
+                f"negocio='{filter_params['negocio']}'"
+                if _has_negocio
+                else f"categoria (trade_ids={filter_params['trade_ids']})"
+            )
             print(
                 f"[Benefits] Geo-fallback: 0 resultados en zona para "
-                f"negocio='{filter_params['negocio']}' → retry global"
+                f"{_what} → retry global"
             )
             global_benefits = await _get_all_benefits_cached(
                 config, headers, timeout, state_ids=None

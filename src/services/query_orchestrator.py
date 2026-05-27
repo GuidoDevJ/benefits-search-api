@@ -25,6 +25,7 @@ Pipeline:
   14. Guardar nueva interacción en memoria
 """
 
+import os
 import re
 import time
 import unicodedata
@@ -32,7 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 from uuid import uuid4
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 try:
     from ..config import (
@@ -773,26 +774,28 @@ class QueryOrchestrator:
         else:
             gathering = search_context if search_context.get("gathering") else {}
 
-            # Soft-hint: si la búsqueda anterior tenía categoría y la nueva
-            # clasificación no detectó ninguna (ej: "ofertas en combustibles"
-            # donde "combustibles" plural no matcheó el keyword singular),
-            # heredar la categoría previa para evitar una clarificación
-            # innecesaria. Solo aplica cuando no hay gathering activo.
+            # Soft-hint: si la búsqueda anterior tenía categoría o negocio
+            # y la nueva clasificación no detectó ninguno (ej: "ofertas en
+            # combustibles" donde "combustibles" plural no matcheó), heredar
+            # el contexto previo para evitar una clarificación innecesaria.
+            # Solo aplica cuando no hay gathering activo.
+            _prev_cat = search_context.get("categoria_benefits")
+            _prev_neg = search_context.get("negocio")
             if (
                 not search_context.get("gathering")
-                and search_context.get("categoria_benefits")
+                and (_prev_cat or _prev_neg)
                 and not classification_dict.get("categoria_benefits")
                 and not classification_dict.get("negocio")
                 and classification.intent == "benefits"
             ):
-                gathering = {
-                    k: search_context[k]
-                    for k in ("categoria_benefits", "provincia")
-                    if k in search_context
-                }
+                _inherit_keys = [k for k in (
+                    "categoria_benefits", "negocio", "provincia"
+                ) if k in search_context]
+                gathering = {k: search_context[k] for k in _inherit_keys}
                 print(
                     f"{log_prefix} Soft-hint: heredando "
                     f"cat={gathering.get('categoria_benefits')} "
+                    f"neg={gathering.get('negocio')} "
                     "del search_context anterior"
                 )
 
@@ -855,7 +858,9 @@ class QueryOrchestrator:
             graph_context = {"classification": merged_clf}
 
         # ── 12. Invocar grafo ─────────────────────────────────────────────
-        messages = history + [HumanMessage(content=query)]
+        _max_hist = int(os.getenv("MAX_HISTORY_MSGS", "6"))
+        _trimmed = history[-_max_hist:] if len(history) > _max_hist else history
+        messages = _trimmed + [HumanMessage(content=query)]
         result = await get_graph().ainvoke(
             {
                 "messages": messages,

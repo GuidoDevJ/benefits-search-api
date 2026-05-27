@@ -113,6 +113,14 @@ def _needs_clarification(
     if provincia:
         return False, ""
 
+    # Si ya hay una búsqueda completada en curso (no gathering),
+    # no interrumpir con clarificación — el contexto previo es suficiente.
+    _active_ctx = up.get("search_context") or {}
+    if not _active_ctx.get("gathering") and (
+        _active_ctx.get("categoria_benefits") or _active_ctx.get("negocio")
+    ):
+        return False, ""
+
     known_dias = merged.get("dias") or (
         [merged["dia"]] if merged.get("dia") else None
     )
