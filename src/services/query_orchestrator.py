@@ -283,6 +283,10 @@ class OrchestratorResult:
     user_prefs: dict = field(default_factory=dict)
     is_early_exit: bool = False
     total_ms: int = 0
+    exit_intent: bool = False
+    detected_intent: Optional[str] = None
+    trigger_text: Optional[str] = None
+    flow_id: Optional[str] = None
 
 
 # ── Orquestador ───────────────────────────────────────────────────────────
@@ -389,6 +393,7 @@ class QueryOrchestrator:
                     session_id=session_id,
                     is_early_exit=True,
                     total_ms=int((time.monotonic() - t_start) * 1000),
+                    exit_intent=True,
                 )
             classification = await classify_query(query)
 
@@ -613,6 +618,7 @@ class QueryOrchestrator:
                 session_id=session_id,
                 is_early_exit=True,
                 total_ms=total_ms,
+                exit_intent=True,
             )
 
         # ── 6. Persistir provincia inline (query mixta beneficio+zona) ───
