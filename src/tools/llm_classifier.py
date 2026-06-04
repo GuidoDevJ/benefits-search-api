@@ -29,7 +29,11 @@ except ImportError:
     from src.config import AWS_REGION, BEDROCK_MODEL_ID
 
 # Singleton — una sola instancia para toda la vida del proceso
-_llm = ChatBedrock(model_id=BEDROCK_MODEL_ID, region_name=AWS_REGION)
+_llm = ChatBedrock(
+    model_id=BEDROCK_MODEL_ID,
+    region_name=AWS_REGION,
+    model_kwargs={"max_tokens": 200, "temperature": 0},
+)
 
 
 # ── Categorías y provincias válidas ──────────────────────────────────────
@@ -73,7 +77,8 @@ Devolvé ÚNICAMENTE un JSON con este formato exacto (sin texto adicional):
 INTENT:
 - "benefits" : descuentos, promos, beneficios, cuotas sin interés, reintegros
 - "tienda"   : el usuario quiere COMPRAR algo (producto, precio, modelo)
-- "location" : el usuario solo indica su ciudad/provincia (ej: "soy de Corrientes", "Mendoza", "vivo en Santa Fe")
+- "location" : el usuario solo indica su ciudad/provincia \
+(ej: "soy de Corrientes", "Mendoza", "vivo en Santa Fe")
 - "unknown"  : saludos, preguntas sin sentido, temas irrelevantes al banco
 
 CATEGORIA_BENEFITS (solo si intent=benefits, si aplica):

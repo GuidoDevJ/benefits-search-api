@@ -129,6 +129,68 @@ _UNKNOWN_RESPONSE = (
     "• Beneficios para días específicos o comercios concretos"
 )
 
+# ── Confirmación de exit intent ───────────────────────────────────────────
+
+_PENDING_EXIT_KEY = "pending_exit_query"
+
+_EXIT_CONFIRM_QUESTION = (
+    "Antes de continuar, ¿lo que consultaste tiene alguna relación con "
+    "descuentos, beneficios o comercios de tu tarjeta Comafi? "
+    "Respondé Sí o No."
+)
+
+_EXIT_CONFIRMED_BACK = (
+    "Perfecto, seguí consultando sobre descuentos y beneficios."
+)
+
+_EXIT_CONFIRMED_OUT = (
+    "Entendido. Eso está fuera de lo que puedo ayudarte acá. "
+    "Cuando lo necesites, volvé a escribir exactamente:\n\n"
+    '"{query}"'
+)
+
+_EXIT_REASK = (
+    "No entendí tu respuesta. "
+    "¿Lo que preguntaste antes tiene que ver con beneficios o descuentos "
+    "de tu tarjeta? Respondé Sí o No."
+)
+
+async def _classify_confirmation(query: str) -> str:
+    """
+    Usa el mismo LLM del pipeline para determinar si la respuesta del
+    usuario a la pregunta de confirmación es AFIRMATIVO, NEGATIVO o DUDOSO.
+
+    Retorna siempre una de esas tres strings. En caso de error retorna DUDOSO.
+    """
+    try:
+        from ..tools.llm_classifier import _llm
+    except ImportError:
+        from src.tools.llm_classifier import _llm
+
+    from langchain_core.messages import HumanMessage
+
+    prompt = (
+        "El usuario respondió a la pregunta: "
+        "'¿Lo que consultaste tiene alguna relación con descuentos, "
+        "beneficios o comercios de tu tarjeta Comafi?'\n\n"
+        f'Su respuesta fue: "{query}"\n\n'
+        "Analizá si es una respuesta afirmativa o negativa a esa pregunta.\n"
+        "Respondé ÚNICAMENTE con una de estas tres palabras: "
+        "AFIRMATIVO, NEGATIVO o DUDOSO"
+    )
+
+    try:
+        response = await _llm.ainvoke([HumanMessage(content=prompt)])
+        raw = response.content
+        result = (raw if isinstance(raw, str) else str(raw)).strip().upper()
+        for keyword in ("AFIRMATIVO", "NEGATIVO", "DUDOSO"):
+            if keyword in result:
+                return keyword
+        return "DUDOSO"
+    except Exception as exc:
+        print(f"[ExitConfirm] Error clasificando confirmación: {exc}")
+        return "DUDOSO"
+
 
 def _is_help_query(query: str) -> bool:
     """Detecta si la consulta es una pregunta sobre capacidades del agente."""
@@ -374,28 +436,44 @@ class QueryOrchestrator:
         if classification is None:
             # fast_classify no lo reconoció — validar antes de gastar tokens
             if not query or not query.strip() or not is_valid_query(query):
-                resp = _UNKNOWN_RESPONSE
-                if audit_service:
-                    await audit_service.record_user_input(
-                        session_id=session_id,
-                        model_id=BEDROCK_MODEL_ID,
-                        query=query,
-                        nlp_result={"intent": "invalid"},
-                    )
-                    await audit_service.record_final_response(
-                        session_id=session_id,
-                        model_id=BEDROCK_MODEL_ID,
+                # Excepción: si el usuario tiene una confirmación de exit
+                # pendiente (ej: respondió "no"/"si" a la pregunta de salida),
+                # la query corta es válida — no la descartar.
+                _has_pending = False
+                if phone:
+                    try:
+                        from ..memory import get_prefs_service as _gps
+                        _ps = await _gps()
+                        _sc = await _ps.load_search_context(phone)
+                        _has_pending = bool(_sc.get(_PENDING_EXIT_KEY))
+                    except Exception:
+                        pass
+
+                if not _has_pending:
+                    resp = _UNKNOWN_RESPONSE
+                    if audit_service:
+                        await audit_service.record_user_input(
+                            session_id=session_id,
+                            model_id=BEDROCK_MODEL_ID,
+                            query=query,
+                            nlp_result={"intent": "invalid"},
+                        )
+                        await audit_service.record_final_response(
+                            session_id=session_id,
+                            model_id=BEDROCK_MODEL_ID,
+                            response=resp,
+                            total_latency_ms=int((time.monotonic() - t_start) * 1000),
+                        )
+                    return OrchestratorResult(
                         response=resp,
-                        total_latency_ms=int((time.monotonic() - t_start) * 1000),
+                        session_id=session_id,
+                        is_early_exit=True,
+                        total_ms=int((time.monotonic() - t_start) * 1000),
+                        exit_intent=True,
                     )
-                return OrchestratorResult(
-                    response=resp,
-                    session_id=session_id,
-                    is_early_exit=True,
-                    total_ms=int((time.monotonic() - t_start) * 1000),
-                    exit_intent=True,
-                )
-            classification = await classify_query(query)
+
+            if classification is None:
+                classification = await classify_query(query)
 
         classification_dict = classification.model_dump()
 
@@ -604,8 +682,76 @@ class QueryOrchestrator:
                     await on_unknown_query(query)
                 except Exception as exc:
                     print(f"{log_prefix} Error en on_unknown_query: {exc}")
-            resp = _UNKNOWN_RESPONSE
+
             total_ms = int((time.monotonic() - t_start) * 1000)
+            pending_query = search_context.get(_PENDING_EXIT_KEY)
+
+            # ── Turno N+1: el usuario responde a la confirmación ──────────
+            if pending_query and phone and prefs_svc:
+                result = await _classify_confirmation(query)
+                print(
+                    f"{log_prefix} ExitConfirm: "
+                    f"'{query}' → {result} (pending='{pending_query[:40]}')"
+                )
+
+                # Limpiar el estado pendiente del search_context
+                try:
+                    clean_ctx = dict(search_context)
+                    clean_ctx.pop(_PENDING_EXIT_KEY, None)
+                    await prefs_svc.update(
+                        phone, search_context=clean_ctx
+                    )
+                except Exception as exc:
+                    print(f"{log_prefix} Error limpiando pending: {exc}")
+
+                if result == "AFIRMATIVO":
+                    resp = _EXIT_CONFIRMED_BACK
+                    exit_flag = False
+                elif result == "NEGATIVO":
+                    resp = _EXIT_CONFIRMED_OUT.format(query=pending_query)
+                    exit_flag = True
+                else:
+                    # DUDOSO — re-preguntar una vez, manteniendo el pending
+                    try:
+                        reask_ctx = dict(search_context)
+                        await prefs_svc.update(
+                            phone, search_context=reask_ctx
+                        )
+                    except Exception:
+                        pass
+                    resp = _EXIT_REASK
+                    exit_flag = False
+
+                if audit_service:
+                    await audit_service.record_final_response(
+                        session_id=session_id,
+                        model_id=BEDROCK_MODEL_ID,
+                        response=resp,
+                        total_latency_ms=total_ms,
+                    )
+                return OrchestratorResult(
+                    response=resp,
+                    session_id=session_id,
+                    is_early_exit=True,
+                    total_ms=total_ms,
+                    exit_intent=exit_flag,
+                    trigger_text=pending_query if exit_flag else None,
+                )
+
+            # ── Turno N: nueva query desconocida → guardar y preguntar ────
+            if phone and prefs_svc:
+                try:
+                    new_ctx = dict(search_context)
+                    new_ctx[_PENDING_EXIT_KEY] = query
+                    await prefs_svc.update(phone, search_context=new_ctx)
+                    resp = _EXIT_CONFIRM_QUESTION
+                except Exception as exc:
+                    print(f"{log_prefix} Error guardando pending: {exc}")
+                    resp = _UNKNOWN_RESPONSE
+            else:
+                # Sin sesión persistida → respuesta directa
+                resp = _UNKNOWN_RESPONSE
+
             if audit_service:
                 await audit_service.record_final_response(
                     session_id=session_id,
@@ -618,7 +764,7 @@ class QueryOrchestrator:
                 session_id=session_id,
                 is_early_exit=True,
                 total_ms=total_ms,
-                exit_intent=True,
+                exit_intent=False,
             )
 
         # ── 6. Persistir provincia inline (query mixta beneficio+zona) ───

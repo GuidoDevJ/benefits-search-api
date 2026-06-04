@@ -39,6 +39,7 @@ _guardrails = (
 _llm_guarded = ChatBedrock(
     model_id=BEDROCK_MODEL_ID,
     region_name=AWS_REGION,
+    model_kwargs={"max_tokens": 800},
     **({"guardrails": _guardrails} if _guardrails else {}),
 )
 
@@ -48,6 +49,7 @@ _llm_guarded = ChatBedrock(
 _llm_benefits = ChatBedrock(
     model_id=BEDROCK_MODEL_ID,
     region_name=AWS_REGION,
+    model_kwargs={"max_tokens": 800},
 )
 
 _graph = None

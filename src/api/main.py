@@ -188,8 +188,6 @@ async def get_benefits(query: QueryRequest):
                     "session_id": result.session_id,
                     "exit_intent": result.exit_intent,
                     "detected_intent": result.detected_intent,
-                    "trigger_text": result.trigger_text,
-                    "flow_id": result.flow_id,
                 },
             },
         })

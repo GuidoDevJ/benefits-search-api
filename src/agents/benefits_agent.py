@@ -56,7 +56,7 @@ def _extract_token_usage(response) -> Optional[TokenUsage]:
 
 
 # Frases de acuse de recibo que el LLM tiende a generar antes de los resultados.
-# Se eliminan de forma determinística para que la respuesta empiece directo al grano.
+# Se eliminan determinísticamente para que la respuesta empiece directo al grano.
 _ACK_RE = re.compile(
     r"^(?:"
     r"entendido[,.]?\s*"
@@ -200,22 +200,17 @@ def _build_system_prompt(
     user_context: Optional[UserContext] = None,
 ) -> str:
     """
-    Ensambla el system prompt con orden fijo y validación de datos.
-
-    Orden fijo (nunca altera):
-      1. base_system  — instrucciones del agente
-      2. user_ctx     — contexto del cliente
-      3. results      — datos de búsqueda + instrucción de formateo
+    Ensambla el system prompt como string para compatibilidad con ChatBedrock.
 
     Maneja los 3 casos posibles de tool_result:
       A. Error sin datos → mensaje de error explícito y amable
       B. Sin resultados (data=[]) → instrucción contextual explícita
       C. Con resultados → datos validados + instrucción de formateo
     """
-    sections: list[str] = [base_system]
+    dynamic_sections: list[str] = []
 
     if user_ctx:
-        sections.append(f"---\nCONTEXTO DEL CLIENTE:\n{user_ctx}")
+        dynamic_sections.append(f"---\nCONTEXTO DEL CLIENTE:\n{user_ctx}")
 
     error = tool_result.get("error")
     data = tool_result.get("data")
@@ -289,8 +284,10 @@ def _build_system_prompt(
             "del prompt."
         )
 
-    sections.append(result_block)
-    return "\n\n".join(sections)
+    dynamic_sections.append(result_block)
+
+    dynamic_text = "\n\n".join(dynamic_sections)
+    return f"{base_system}\n\n{dynamic_text}" if dynamic_text else base_system
 
 
 def create_benefits_agent(llm: ChatBedrock):
