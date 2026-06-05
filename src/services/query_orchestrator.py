@@ -145,7 +145,7 @@ _EXIT_CONFIRMED_BACK = (
 
 _EXIT_CONFIRMED_OUT = (
     "Entendido. Eso está fuera de lo que puedo ayudarte acá. "
-    "Cuando lo necesites, volvé a escribir exactamente:\n\n"
+    "Volvé a escribir exactamente:\n\n"
     '"{query}"'
 )
 
@@ -473,7 +473,19 @@ class QueryOrchestrator:
                     )
 
             if classification is None:
-                classification = await classify_query(query)
+                # Cargar search_context para inyectar contexto al LLM.
+                # Solo se ejecuta en el ~15 % de queries que llegan acá.
+                _llm_ctx: dict = {}
+                if phone:
+                    try:
+                        from ..memory import get_prefs_service as _gps
+                        _ps = await _gps()
+                        _llm_ctx = await _ps.load_search_context(phone)
+                    except Exception:
+                        pass
+                classification = await classify_query(
+                    query, context=_llm_ctx or None
+                )
 
         classification_dict = classification.model_dump()
 

@@ -247,6 +247,69 @@ _ALL_CATEGORY_TOKENS: frozenset[str] = frozenset(
     if " " not in token
 )
 
+# ── Patrones de follow-up ("dame mas info de X") ─────────────────────────
+# Detectan cuando el usuario pide más información sobre un comercio visto
+# en la respuesta anterior, sin repetir la categoría explícitamente.
+
+_FOLLOW_UP_RE = re.compile(
+    r"(?:dame|da|dime|mostrame|quiero|necesito)\s+"
+    r"(?:mas\s+)?"
+    r"(?:info|informacion|detalle|detalles?|datos?)\s+"
+    r"(?:de|sobre|acerca\s+de)\s+"
+    r"(.{2,40}?)$"
+)
+_INFO_ABOUT_RE = re.compile(
+    r"^(?:informacion|info)\s+(?:de|sobre)\s+(.{2,40}?)$"
+)
+_TELL_ME_RE = re.compile(
+    r"^(?:hablame|contame|que\s+(?:es|onda)\s+(?:con\s+)?)\s+(.{2,40}?)$"
+)
+
+_FOLLOW_UP_STRIP_PREFIX = re.compile(
+    r"^(?:la|el|los|las|una?|del?)\s+"
+)
+_FOLLOW_UP_STRIP_ROLE = re.compile(
+    r"^(?:tienda|local|negocio|comercio|shop|store)\s+"
+)
+
+
+def _detect_follow_up_negocio(query: str) -> Optional[str]:
+    """
+    Detecta patrones de follow-up y extrae el nombre del negocio.
+
+    Cubre: "dame mas info de Ver", "info de ShopGallery",
+           "informacion sobre Freddo", "hablame de Kansas", etc.
+
+    Retorna el candidato normalizado o None si no hay match o es ambiguo.
+    """
+    norm = _normalize(query)
+
+    entity: Optional[str] = None
+    for pattern in (_FOLLOW_UP_RE, _INFO_ABOUT_RE, _TELL_ME_RE):
+        m = pattern.search(norm)
+        if m:
+            entity = m.group(1).strip()
+            break
+
+    if not entity:
+        return None
+
+    # Limpiar artículos y roles ("la tienda Ver" → "ver")
+    entity = _FOLLOW_UP_STRIP_PREFIX.sub("", entity).strip()
+    entity = _FOLLOW_UP_STRIP_ROLE.sub("", entity).strip()
+
+    if len(entity) < 2:
+        return None
+
+    # Descartar si todos los tokens son keywords genéricos (beneficios/categorías)
+    known = _ALL_CATEGORY_TOKENS | _BENEFIT_KEYWORDS | _NEGOCIO_STOP_TOKENS
+    useful = set(entity.split()) - known
+    if not useful:
+        return None
+
+    return entity
+
+
 # Patrón: texto después de "en"/"para"/"sobre" que podría ser un negocio.
 # "sobre" cubre "quiero saber mas sobre Kansas", "info sobre Freddo", etc.
 # Captura hasta 4 palabras (máx. nombre comercial razonable).
@@ -452,6 +515,19 @@ def fast_classify(query: str) -> Optional[Classification]:
 
     # ── Días (multi-día incluido) ─────────────────────────────────────
     dias = _detect_days(text)
+
+    # ── Follow-up ("dame mas info de X") — tiene prioridad sobre el resto ──
+    # Si el usuario pide info de un negocio específico que vio en la respuesta
+    # anterior, extraerlo directo sin necesidad de la categoría explícita.
+    follow_up_negocio = _detect_follow_up_negocio(query)
+    if follow_up_negocio:
+        # Verificar primero si el nombre coincide con un negocio conocido
+        _fu_norm = _normalize(follow_up_negocio)
+        for pattern, nombre in _NEGOCIO_PATTERNS:
+            if pattern.search(_fu_norm):
+                follow_up_negocio = nombre
+                break
+        return Classification(intent="benefits", negocio=follow_up_negocio)
 
     # ── Negocio ───────────────────────────────────────────────────────
     negocio: Optional[str] = None

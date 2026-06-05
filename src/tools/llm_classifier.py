@@ -168,21 +168,43 @@ class Classification(BaseModel):
 
 # ── Clasificador ──────────────────────────────────────────────────────────
 
-async def classify_query(query: str) -> Classification:
+async def classify_query(
+    query: str,
+    context: dict | None = None,
+) -> Classification:
     """
     Clasifica la consulta del usuario y extrae entidades.
 
     Fallback del fast_classify. Consume tokens de Bedrock.
 
     Args:
-        query: Texto del usuario.
+        query:   Texto del usuario.
+        context: search_context de la sesión (opcional). Si se provee,
+                 se inyecta como hint para resolver referencias ambiguas
+                 (ej: "dame info de Ver" cuando la última búsqueda fue moda).
 
     Returns:
         Classification con intent y entidades relevantes.
     """
+    context_hint = ""
+    if context:
+        parts = []
+        if context.get("categoria_benefits"):
+            cat = context["categoria_benefits"]
+            parts.append(f"última categoría buscada: {cat}")
+        if context.get("negocio"):
+            parts.append(f"último negocio buscado: {context['negocio']}")
+        if context.get("dias"):
+            parts.append(f"días filtrados: {', '.join(context['dias'])}")
+        if parts:
+            context_hint = (
+                "\n\nContexto de la sesión (usalo para resolver "
+                f"referencias ambiguas): {'; '.join(parts)}."
+            )
+
     messages = [
         SystemMessage(content=_SYSTEM_PROMPT),
-        HumanMessage(content=f"Consulta: {query}"),
+        HumanMessage(content=f"Consulta: {query}{context_hint}"),
     ]
 
     try:
